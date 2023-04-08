@@ -3,10 +3,14 @@ import math
 import torch
 import torch.nn as nn
 from collections import OrderedDict
-
+import sys
+sys.path.append("..")
 from util import download_file
 
 MOBILE_NET_V2_UTR = 'https://s3-us-west-1.amazonaws.com/models-nima/mobilenetv2.pth.tar'
+
+current_path = os.path.abspath(__file__)
+directory_name = os.path.dirname(current_path)
 
 def conv_bn(inp, oup, stride):
     return nn.Sequential(
@@ -126,7 +130,7 @@ class MobileNetV2(nn.Module):
 def mobile_net_v2(pretrained=True):
     model = MobileNetV2()
     if pretrained:
-        path_to_model = '/home/meimei/mobilenetv2.pth.tar'
+        path_to_model = os.path.join(directory_name, '../pretrain_model/mobilenetv2.pth.tar')
         if not os.path.exists(path_to_model):
             path_to_model = download_file(MOBILE_NET_V2_UTR, path_to_model)
         state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage)
@@ -153,7 +157,7 @@ def base_net(pretrained = True):
     model_dict = model.state_dict()
 
     if pretrained:
-        path_to_model = "./pretrain_model/u_model.pth"
+        path_to_model = os.path.join(directory_name, "../pretrain_model/u_model.pth")
         state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage)
 
         new_state_dict = OrderedDict()
@@ -172,7 +176,7 @@ def sa_net(pretrained = True):
     model = nn.Sequential(*list(model.children())[:-2])
     model_dict = model.state_dict()
     if pretrained:
-        path_to_model = "./pretrain_model/e_model.pth"
+        path_to_model = os.path.join(directory_name, "../pretrain_model/e_model.pth")
         state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage)
         from collections import OrderedDict
         new_state_dict = OrderedDict()

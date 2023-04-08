@@ -14,10 +14,16 @@ from sklearn.metrics import accuracy_score
 from models.relic1_model import NIMA
 # from models.relic2_model import NIMA
 from dataset import AVADataset
+current_path = os.path.abspath(__file__)
+directory_name = os.path.dirname(current_path)
+import sys
+sys.path.append("..")
 from util import EDMLoss,AverageMeter
-import option
+import option as option
 
-f = open('/data/mayme/git/AVA/checkpoint/log_test.txt', 'w')
+
+filepath='../../data/AVA/checkpoint/log_test.txt'
+f = open(os.path.join(directory_name, filepath), 'w')
 
 opt = option.init()
 opt.device = torch.device("cuda:{}".format(opt.gpu_id))
@@ -160,7 +166,7 @@ def start_check_model(opt):
     _,val_loader, test_loader = create_data_part(opt)
     model = NIMA()
     model.eval()
-    model.load_state_dict(torch.load(opt.path_to_model_weight))
+    model.load_state_dict(torch.load(opt.path_to_model_weight,map_location='cuda:0'))
     criterion = EDMLoss()
 
     model = model.to(opt.device)
