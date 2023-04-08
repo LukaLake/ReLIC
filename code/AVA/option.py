@@ -14,7 +14,7 @@ def init():
     parser.add_argument('--experiment_dir_name', type=str, default='.',
                         help='directory to project')
 
-    parser.add_argument('--path_to_model_weight', type=str, default='/data/mayme/git/AVA/pretrain_model/relic1_model.pth',
+    parser.add_argument('--path_to_model_weight', type=str, default='./pretrain_model/relic1_model.pth',
                         help='directory to pretrain model')
 
     parser.add_argument('--init_lr', type=int, default=0.00003, help='learning_rate'
