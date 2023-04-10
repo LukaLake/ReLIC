@@ -35,14 +35,40 @@ class AVADataset(Dataset):
         return self.df.shape[0]
 
     def __getitem__(self, item):
-        row = self.df.iloc[item]
+        row = self.df.iloc[item] # 从df中获取行数据并存储在row中
         scores_names = [f'score{i}' for i in range(2,12)]
         y = np.array([row[k] for k in scores_names])
         p = y / y.sum()
 
         image_id = row['image_id']
         image_path = os.path.join(self.images_path, f'{image_id}.jpg')
-        image = default_loader(image_path)
+        image = default_loader(image_path)  # 读取为Image对象
         x = self.transform(image)
         return x, p.astype('float32')
 
+# 读入预测用数据
+class TestDataset(Dataset):
+    def __init__(self, path_to_csv, images_path):
+        self.df = pd.read_csv(path_to_csv)
+        self.images_path =  images_path
+        
+        self.transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        normalize])
+
+
+    def __len__(self):
+        return self.df.shape[0]
+
+    def __getitem__(self, item):
+        row = self.df.iloc[item] # 从df中获取行数据并存储在row中
+        scores_names = [f'score{i}' for i in range(2,12)]
+        y = np.array([row[k] for k in scores_names])
+        p = y / y.sum()
+
+        image_id = row['image_id']
+        image_path = os.path.join(self.images_path, f'{image_id}.jpg')
+        image = default_loader(image_path)  # 读取为Image对象
+        x = self.transform(image)
+        return x, p.astype('float32')

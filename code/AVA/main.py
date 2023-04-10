@@ -7,6 +7,8 @@ from scipy.stats import pearsonr
 from scipy.stats import spearmanr
 from tensorboardX import SummaryWriter
 from sklearn.metrics import accuracy_score
+from torchvision import transforms
+from torchvision.datasets.folder import default_loader
 
 # from models.u_model import NIMA
 # from models.e_model import NIMA
@@ -187,19 +189,39 @@ def pred(opt):
     model = model.to(opt.device)
     criterion.to(opt.device)
 
-    ds = AVADataset(opt.test_csv_path, opt.path_to_images, if_train=False)
-    loader = DataLoader(ds, batch_size=opt.batch_size, num_workers=opt.num_workers, shuffle=False)
+    # test_csv_path = os.path.join(opt.path_to_save_csv, 'test.csv')
+    # ds = AVADataset(test_csv_path, opt.path_to_images, if_train=False)
+    # loader = DataLoader(ds, batch_size=opt.batch_size, num_workers=opt.num_workers, shuffle=False)
 
-    for idx, (x, y) in enumerate(tqdm(loader)):
-        x = x.to(opt.device)
-        y = y.type(torch.FloatTensor)
-        y = y.to(opt.device)
+    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
+    IMAGE_NET_STD = [0.229, 0.224, 0.225]
+    normalize = transforms.Normalize(
+            mean=IMAGE_NET_MEAN,
+            std=IMAGE_NET_STD)
+    transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            normalize])
+    
+    image_path=os.path.join(opt.path_to_images, '954013.jpg')
+    
+    image = default_loader(image_path)  # 读取为Image对象
+    x=transform(image)
+    x = np.expand_dims(x, 0)
+    x = torch.from_numpy(x).float()
+    x = x.to(opt.device)
+    y_pred = model(x)
 
-        y_pred = model(x)
+    pscore, pscore_np = get_score(opt,y_pred)
+    print('y_pred:', y_pred)
+    print(pscore_np)
 
 if __name__ =="__main__":
 
     #### train model
     # start_train(opt)
     #### test model
-    start_check_model(opt)
+    # start_check_model(opt)
+
+    #### pred
+    pred(opt)
