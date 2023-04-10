@@ -178,6 +178,25 @@ def start_check_model(opt):
     print('loss:', test_loss, 'acc:', acc, 'lcc:', lcc_mean[0], 'srcc:', srcc_mean[0])
     print('vloss:', val_loss, 'vacc:', vacc, 'vlcc:', vlcc_mean[0], 'vsrcc:', vsrcc_mean[0])
 
+def pred(opt):
+    model = NIMA()
+    model.eval()
+    model.load_state_dict(torch.load(opt.path_to_model_weight,map_location='cuda:0'))
+    criterion = EDMLoss()
+
+    model = model.to(opt.device)
+    criterion.to(opt.device)
+
+    ds = AVADataset(opt.test_csv_path, opt.path_to_images, if_train=False)
+    loader = DataLoader(ds, batch_size=opt.batch_size, num_workers=opt.num_workers, shuffle=False)
+
+    for idx, (x, y) in enumerate(tqdm(loader)):
+        x = x.to(opt.device)
+        y = y.type(torch.FloatTensor)
+        y = y.to(opt.device)
+
+        y_pred = model(x)
+
 if __name__ =="__main__":
 
     #### train model
