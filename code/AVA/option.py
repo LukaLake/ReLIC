@@ -7,6 +7,9 @@ def init():
 
     parser.add_argument('--path_to_images', type=str, default='C:/Users/123/Documents/GitHub/ReLIC/data/AVA/Batch1',
                         help='directory to images')
+    
+    parser.add_argument('--image_name', type=str, default='test1.png',
+                        help='image name')
 
     parser.add_argument('--path_to_save_csv', type=str,default="C:/Users/123/Documents/GitHub/ReLIC/data/AVA/",
                         help='directory to csv_folder')

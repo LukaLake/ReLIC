@@ -203,7 +203,7 @@ def pred(opt):
             transforms.ToTensor(),
             normalize])
     
-    image_path=os.path.join(opt.path_to_images, '954013.jpg')
+    image_path=os.path.join(opt.path_to_images, opt.image_name)
     
     image = default_loader(image_path)  # 读取为Image对象
     x=transform(image)
