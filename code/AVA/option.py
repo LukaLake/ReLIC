@@ -5,10 +5,10 @@ def init():
     parser.add_argument('--path_to_ava_txt', type=str, default="C:/Users/123/Documents/GitHub/ReLIC/data/AVA/AVA.txt",
                         help='directory to csv_folder')
 
-    parser.add_argument('--path_to_images', type=str, default='C:/Users/123/Documents/GitHub/ReLIC/data/AVA/Batch1',
+    parser.add_argument('--path_to_images', type=str, default='D:/BaiduNetdiskDownload/group1/',
                         help='directory to images')
     
-    parser.add_argument('--image_name', type=str, default='test1.png',
+    parser.add_argument('--image_name', type=str, default='img_0000_03.jpg',
                         help='image name')
 
     parser.add_argument('--path_to_save_csv', type=str,default="C:/Users/123/Documents/GitHub/ReLIC/data/AVA/",
