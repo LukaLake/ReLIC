@@ -22,7 +22,7 @@ import sys
 sys.path.append("..")
 from util import EDMLoss,AverageMeter
 import option as option
-
+import shutil
 
 filepath='../../data/AVA/checkpoint/log_test.txt'
 f = open(os.path.join(directory_name, filepath), 'w')
@@ -30,12 +30,14 @@ f = open(os.path.join(directory_name, filepath), 'w')
 opt = option.init()
 opt.device = torch.device("cuda:{}".format(opt.gpu_id))
 
+
 def adjust_learning_rate(params, optimizer, epoch):
     """Sets the learning rate to the initial LR
        decayed by 10 every 30 epochs"""
     lr = params.init_lr * (0.1 ** (epoch // 10))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
 
 def get_score(opt,y_pred):
     w = torch.from_numpy(np.linspace(1,10, 10))
@@ -180,7 +182,8 @@ def start_check_model(opt):
     print('loss:', test_loss, 'acc:', acc, 'lcc:', lcc_mean[0], 'srcc:', srcc_mean[0])
     print('vloss:', val_loss, 'vacc:', vacc, 'vlcc:', vlcc_mean[0], 'vsrcc:', vsrcc_mean[0])
 
-def pred(opt):
+# 预测单个图片
+def pred_single(opt):
     model = NIMA()
     model.eval()
     model.load_state_dict(torch.load(opt.path_to_model_weight,map_location='cuda:0'))
@@ -203,7 +206,7 @@ def pred(opt):
             transforms.ToTensor(),
             normalize])
     
-    image_path=os.path.join(opt.path_to_images, opt.image_name)
+    image_path=os.path.join("C:/Users/123/Documents/GitHub/ReLIC/data/AVA/Batch1", opt.image_name)
     
     image = default_loader(image_path)  # 读取为Image对象
     x=transform(image)
@@ -216,6 +219,69 @@ def pred(opt):
     print('y_pred:', y_pred)
     print(pscore_np)
 
+# 预测多个图片
+def pred(opt):
+
+    path = opt.path_to_images+'/group1'
+    image_filenames = []
+    for filename in os.listdir(path):
+        if filename.endswith('.jpg') or filename.endswith('.png') or filename.endswith('.jpeg'):
+            image_filenames.append(filename)
+
+
+    model = NIMA()
+    model.eval()
+    model.load_state_dict(torch.load(opt.path_to_model_weight,map_location='cuda:0'))
+    criterion = EDMLoss()
+
+    model = model.to(opt.device)
+    criterion.to(opt.device)
+
+    # test_csv_path = os.path.join(opt.path_to_save_csv, 'test.csv')
+    # ds = AVADataset(test_csv_path, opt.path_to_images, if_train=False)
+    # loader = DataLoader(ds, batch_size=opt.batch_size, num_workers=opt.num_workers, shuffle=False)
+
+    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
+    IMAGE_NET_STD = [0.229, 0.224, 0.225]
+    normalize = transforms.Normalize(
+            mean=IMAGE_NET_MEAN,
+            std=IMAGE_NET_STD)
+    transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            normalize])
+    
+    image_score=[]
+
+    for (image) in enumerate(tqdm(image_filenames)) :
+        image_name=image[1]
+        image_path=opt.path_to_images+'/group1/'+image_name
+        
+        image = default_loader(image_path)  # 读取为Image对象
+        x=transform(image)
+        x = np.expand_dims(x, 0)
+        x = torch.from_numpy(x).float()
+        x = x.to(opt.device)
+        y_pred = model(x)
+
+        pscore, pscore_np = get_score(opt,y_pred)
+        image_score.append(dict(image_name=image_name,score=pscore_np))
+
+    image_good=[]
+    for image in image_score:
+        if image.get('score')>5.18:
+            image_good.append(image)
+
+    print(len(image_score))
+    print(len(image_good))
+
+    path_to_good=opt.path_to_images+'/good/'
+    for image in enumerate(tqdm(image_good)):
+        image_name=image[1].get('image_name')
+        image_path=opt.path_to_images+'/group1/'+image_name
+        shutil.copy(image_path,path_to_good+image_name)
+            
+        
 if __name__ =="__main__":
 
     #### train model
@@ -224,4 +290,5 @@ if __name__ =="__main__":
     # start_check_model(opt)
 
     #### pred
-    pred(opt)
+    pred_single(opt)
+    # pred(opt)
