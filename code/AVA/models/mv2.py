@@ -63,6 +63,8 @@ class MobileNetV2(nn.Module):
         # setting of inverted residual blocks
         self.interverted_residual_setting = [
             # t, c, n, s
+            # t 是扩张系数（expansion factor），c 是输出通道数（output channels）
+            # n 是重复次数（number of repeats），s 是步长（stride）
             [1, 16, 1, 1],
             [6, 24, 2, 2],
             [6, 32, 3, 2],
@@ -173,7 +175,7 @@ def base_net(pretrained = True):
 
 def sa_net(pretrained = True):
     model = mobile_net_v2()
-    model = nn.Sequential(*list(model.children())[:-2])
+    model = nn.Sequential(*list(model.children())[:-2]) # 使用 * 运算符将截取后的子模块列表解包，并传递给 nn.Sequential() 函数中，以创建一个新的神经网络模型。
     model_dict = model.state_dict()
     if pretrained:
         path_to_model = os.path.join(directory_name, "../pretrain_model/e_model.pth")
@@ -203,7 +205,9 @@ class CAT(nn.Module):
         x_base = self.base_model(x)
         x_sa = self.sa_model(x)
         x_sa = SelfAttentionMap(x_sa)
-        x = x_base.view(x_base.size(0),-1)
+        # 将张量 x_base 的形状重新设置为 (batch_size, -1)，
+        # 其中 -1 表示 PyTorch 会自动计算出张量在该维度上的大小，以满足新张量的元素数量与原始张量相同的要求。
+        x = x_base.view(x_base.size(0),-1) 
         x1 = x_sa.view(x_sa.size(0),-1)
 
         return x,x1
