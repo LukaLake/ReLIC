@@ -22,6 +22,9 @@ class NIMA(nn.Module):
         super(NIMA, self).__init__()
         base_model = cat_net()
         self.base_model = base_model
+        # 对于在代码中之前定义的所有参数，这些参数的 requires_grad 属性将被设置为 False，
+        # 并且在后续代码中如果尝试修改这些参数的 requires_grad 属性，将不会起作用，因为这些参数已经被标记为不需要计算梯度。
+        # 但是，对于在之后定义的参数，这些参数的 requires_grad 属性将默认为 True，并且可以通过 p.requires_grad = True 等语句来显式地指示需要计算梯度。
         for p in self.parameters():
             p.requires_grad = False
 
