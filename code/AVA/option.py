@@ -8,7 +8,7 @@ def init():
     parser.add_argument('--path_to_images', type=str, default='D:/BaiduNetdiskDownload/group1/',
                         help='directory to images')
     
-    parser.add_argument('--image_name', type=str, default='img_0000_03.jpg',
+    parser.add_argument('--image_name', type=str, default='img_0000_148.jpg',
                         help='image name')
 
     parser.add_argument('--path_to_save_csv', type=str,default="C:/Users/123/Documents/GitHub/ReLIC/data/AVA/",

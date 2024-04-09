@@ -191,6 +191,11 @@ def pred_single(opt):
 
     model = model.to(opt.device)
     criterion.to(opt.device)
+    
+    # 使用 torch.jit.script 或 torch.jit.trace 将模型转换为 TorchScript
+    scripted_model = torch.jit.script(model)
+    # 保存 TorchScript 模型到文件
+    scripted_model.save("path_to_save_model.pt")
 
     # test_csv_path = os.path.join(opt.path_to_save_csv, 'test.csv')
     # ds = AVADataset(test_csv_path, opt.path_to_images, if_train=False)
