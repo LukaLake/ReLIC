@@ -9,6 +9,8 @@ from tensorboardX import SummaryWriter
 from sklearn.metrics import accuracy_score
 from torchvision import transforms
 from torchvision.datasets.folder import default_loader
+import torch.onnx
+import onnx
 
 # from models.u_model import NIMA
 # from models.e_model import NIMA
@@ -219,6 +221,10 @@ def pred_single(opt):
     x = torch.from_numpy(x).float()
     x = x.to(opt.device)
     y_pred = model(x)
+
+    input_names = ["input_image"]
+    output_names = ["output_scores"]
+    torch.onnx.export(model, torch.randn(1, 3, 224, 224).to(opt.device), "path_to_save_model.onnx", verbose=True, input_names=input_names, output_names=output_names)
 
     pscore, pscore_np = get_score(opt,y_pred)
     print('y_pred:', y_pred)
