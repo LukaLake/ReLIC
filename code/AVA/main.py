@@ -13,8 +13,8 @@ from torchvision.datasets.folder import default_loader
 # from models.u_model import NIMA
 # from models.e_model import NIMA
 # from models.relic_model import NIMA
-from models.relic1_model import NIMA
-# from models.relic2_model import NIMA
+# from models.relic1_model import NIMA
+from models.relic2_model import NIMA
 from dataset import AVADataset
 current_path = os.path.abspath(__file__)
 directory_name = os.path.dirname(current_path)
@@ -152,14 +152,11 @@ def start_train(opt):
             'epoch:%d,v_lcc:%.4f,v_srcc:%.4f,v_acc:%.5f,tlcc:%.4f,t_srcc:%.4f,t_acc:%.5f,train:%.5f,val:%.5f,test:%.5f\r\n'
             % (e, vlcc[0], vsrcc[0], vacc, tlcc[0], tsrcc[0], tacc, train_loss, val_loss, test_loss))
         f.flush()
-
         writer.add_scalars("epoch_loss", {'train': train_loss, 'val': val_loss, 'test': test_loss},
                            global_step=e)
-
         writer.add_scalars("lcc_srcc", {'val_lcc': vlcc[0], 'val_srcc': vsrcc[0],
                                         'test_lcc': tlcc[0], 'test_srcc': tsrcc[0]},
                            global_step=e)
-
         writer.add_scalars("acc",{'val_acc': vacc, 'test_acc': tacc}, global_step=e)
 
     writer.close()
@@ -206,7 +203,7 @@ def pred_single(opt):
             transforms.ToTensor(),
             normalize])
     
-    image_path=os.path.join("C:/Users/123/Documents/GitHub/ReLIC/data/AVA/Batch1", opt.image_name)
+    image_path=os.path.join(opt.path_to_images, opt.image_name)
     
     image = default_loader(image_path)  # 读取为Image对象
     x=transform(image)
@@ -280,7 +277,30 @@ def pred(opt):
         image_name=image[1].get('image_name')
         image_path=opt.path_to_images+'/group1/'+image_name
         shutil.copy(image_path,path_to_good+image_name)
-            
+
+def export_to_onnx(model_path, onnx_path, input_size=(1, 3, 224, 224)):
+    # 初始化模型
+    model = NIMA()
+    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    model.eval()
+
+    # 创建虚拟输入
+    dummy_input = torch.randn(*input_size)
+
+    # 导出模型
+    torch.onnx.export(
+        model,
+        dummy_input,
+        onnx_path,
+        export_params=True,
+        opset_version=11,
+        do_constant_folding=True,
+        input_names=['input'],
+        output_names=['output'],
+        dynamic_axes=None
+    )
+
+    print(f"Model has been converted to ONNX and saved at {onnx_path}")            
         
 if __name__ =="__main__":
 
@@ -291,4 +311,5 @@ if __name__ =="__main__":
 
     #### pred
     pred_single(opt)
+    # export_to_onnx(opt.path_to_model_weight, 'relic2_model.onnx')
     # pred(opt)

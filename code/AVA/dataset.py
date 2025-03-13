@@ -1,4 +1,6 @@
 import os
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = False
 from torchvision import transforms
 import pandas as pd
 import numpy as np
@@ -42,7 +44,12 @@ class AVADataset(Dataset):
 
         image_id = row['image_id']
         image_path = os.path.join(self.images_path, f'{image_id}.jpg')
-        image = default_loader(image_path)  # 读取为Image对象
+        try:
+            image = default_loader(image_path)  # 读取为Image对象
+        except OSError:
+            print(f"\nWarning: Image {image_path} is truncated or doesnt exist. Skip instead.")
+            # image = Image.new('RGB', (224, 224), (255, 255, 255))  # 创建一个白色图像
+            return None  # 跳过此图像
         x = self.transform(image)
         return x, p.astype('float32')
 

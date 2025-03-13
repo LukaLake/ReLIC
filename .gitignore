@@ -130,3 +130,7 @@ dmypy.json
 
 *.jpg
 *.png
+*.onnx
+*.pth
+
+code/AVA/trained_models/logs/*
