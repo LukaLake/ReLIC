@@ -4,6 +4,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = False
 from torchvision import transforms
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
+import cv2 as cv
 
 from torch.utils.data import Dataset
 from torchvision.datasets.folder import default_loader
@@ -52,6 +54,80 @@ class AVADataset(Dataset):
             return None  # 跳过此图像
         x = self.transform(image)
         return x, p.astype('float32')
+    
+
+# BAID数据集
+mean = [0.485, 0.456, 0.406]  # RGB
+std = [0.229, 0.224, 0.225]
+
+class BBDataset(Dataset):
+    def __init__(self, file_dir='dataset', type='train', test=False):
+        self.if_test = test
+        self.train_transformer = transforms.Compose(
+            [
+                transforms.ToPILImage(),
+                transforms.Resize((224, 224)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ]
+        )
+
+        self.test_transformer = transforms.Compose(
+            [
+                transforms.ToPILImage(),
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ]
+        )
+
+        self.images = []
+        self.pic_paths = []
+        self.labels = []
+
+        if type == 'train':
+            DATA = pd.read_csv(os.path.join(file_dir,'dataset','train_set.csv'))
+        elif type == 'validation':
+            DATA = pd.read_csv(os.path.join(file_dir,'dataset','val_set.csv'))
+        elif type == 'test':
+            DATA = pd.read_csv(os.path.join(file_dir,'dataset','test_set.csv'))
+
+        labels = DATA['score'].values.tolist()
+        pic_paths = DATA['image'].values.tolist()
+        for i in tqdm(range(len(pic_paths))):
+            pic_path = os.path.join(file_dir,'images', pic_paths[i])
+            label = float(labels[i] / 10)
+            self.pic_paths.append(pic_path)
+            self.labels.append(label)
+
+    def __len__(self):
+        return len(self.pic_paths)
+
+    def __getitem__(self, index):
+        pic_path = self.pic_paths[index]
+        try:
+            # 尝试读取图像
+            img = cv.imread(pic_path)
+            if img is None:
+                raise ValueError(f"Failed to load image: {pic_path}")
+                
+            img = cv.cvtColor(img, cv.COLOR_BGR2RGB)
+            
+            # 应用转换
+            if self.if_test:
+                img = self.test_transformer(img)
+            else:
+                img = self.train_transformer(img)
+                
+            return img, self.labels[index]
+            
+        except Exception as e:
+            print(f"\nWarning: Image {pic_path} error: {str(e)}. Skip instead.")
+            
+            # 策略1: 返回None，需要在DataLoader中使用collate_fn处理
+            return None
+    
 
 # 读入预测用数据
 class TestDataset(Dataset):

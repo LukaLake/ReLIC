@@ -134,3 +134,4 @@ dmypy.json
 *.pth
 
 code/AVA/trained_models/logs/*
+code/AVA/finetune_models/logs/*
