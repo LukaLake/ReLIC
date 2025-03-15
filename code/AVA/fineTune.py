@@ -10,6 +10,7 @@ from tensorboardX import SummaryWriter
 from sklearn.metrics import accuracy_score
 from torchvision import transforms
 from torchvision.datasets.folder import default_loader
+from torch.optim import RAdam
 
 from models.relic2_model import NIMA, NIMA_Finetune
 from dataset import AVADataset, BBDataset
@@ -59,7 +60,15 @@ def collate_fn(batch):
     return torch.utils.data.dataloader.default_collate(batch)
 
 
-def finetune_on_baid(pretrained_path, baid_data_path, save_dir, num_epochs=20, batch_size=32, lr=5e-5, if_continue=False):
+def print_model_layers(model):
+    print("模型层结构:")
+    for name, param in model.named_parameters():
+        print(f"{name}: requires_grad={param.requires_grad}, shape={param.shape}")
+
+
+
+
+def finetune_on_baid(pretrained_path, baid_data_path, save_dir, num_epochs=20, batch_size=32, lr = 1e-4 , if_continue=False):
     """
     在BAID数据集上微调NIMA模型
     
@@ -84,6 +93,9 @@ def finetune_on_baid(pretrained_path, baid_data_path, save_dir, num_epochs=20, b
     finetune_model = load_pretrained_nima(finetune_model, pretrained_path)
     finetune_model = finetune_model.to(device)
     
+    # 在训练开始前打印
+    print_model_layers(finetune_model)
+
     # 加载BAID数据集
     train_dataset = BBDataset(file_dir=baid_data_path, type='train')
     val_dataset = BBDataset(file_dir=baid_data_path, type='validation')
@@ -112,13 +124,25 @@ def finetune_on_baid(pretrained_path, baid_data_path, save_dir, num_epochs=20, b
         if 'baid_head' not in name:
             param.requires_grad = False
     
-    optimizer = torch.optim.AdamW(
+    # optimizer = torch.optim.AdamW(
+    #     filter(lambda p: p.requires_grad, finetune_model.parameters()),
+    #     lr=lr,
+    #     weight_decay=1e-4
+    # )
+
+    optimizer = RAdam(
         filter(lambda p: p.requires_grad, finetune_model.parameters()),
         lr=lr,
-        weight_decay=1e-4
+        weight_decay=1e-3
     )
     
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5,  # 每次减半学习率
+        patience=5,  # 5个epoch没有提升就降低学习率
+        min_lr=1e-6
+    )
     criterion = nn.MSELoss()
     
     # TensorBoard初始化
@@ -126,6 +150,7 @@ def finetune_on_baid(pretrained_path, baid_data_path, save_dir, num_epochs=20, b
     
     # 训练状态
     best_val_loss = float('inf')
+    best_epoch = -1  # 添加记录最佳epoch的变量
     start_epoch = 0
     
     # 如果继续训练，加载检查点
@@ -226,32 +251,67 @@ def finetune_on_baid(pretrained_path, baid_data_path, save_dir, num_epochs=20, b
         # 如果当前模型是最佳模型，保存它
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            best_epoch = epoch  # 记录最佳epoch
             torch.save(finetune_model.state_dict(), os.path.join(save_dir, "best_model.pth"))
             print(f"保存最佳模型，验证损失: {best_val_loss:.4f}")
         
         # 更新学习率
-        scheduler.step()
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(avg_val_loss)
+        else:
+            scheduler.step()
     
-        # 第二阶段：10轮后，解冻部分层进行微调
+        # 第二阶段：10轮后，解冻更多层
         if epoch == 10:
-            print("解冻FC层进行微调")
+            print("第二阶段：解冻FC层和基础模型的最后几层")
             for name, param in finetune_model.named_parameters():
-                if 'fc' in name or 'baid_head' in name:
+                # 解冻所有fc层、baid_head及基础模型的最后一些层
+                if any(x in name for x in ['fc', 'baid_head', 'base_model.model.8', 'base_model.model.9']):
                     param.requires_grad = True
             
             # 更新优化器以包含解冻的参数
-            optimizer = torch.optim.AdamW(
+            optimizer = RAdam(
                 filter(lambda p: p.requires_grad, finetune_model.parameters()),
-                lr=lr * 0.1,  # 降低学习率
-                weight_decay=1e-4
+                lr=lr * 0.5,  # 降低学习率
+                weight_decay=1e-3
             )
             
-            # 重置调度器
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs - epoch)
+            # 重置学习率调度器
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, 
+                mode='min', 
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6
+            )
+
+        # 第三阶段：20轮后，解冻更深的层
+        if epoch == 20:
+            print("第三阶段：解冻更多基础模型层")
+            for name, param in finetune_model.named_parameters():
+                # 解冻基础模型的更多层，但保留前几层冻结
+                if 'base_model.model.0' not in name and 'base_model.model.1' not in name:
+                    param.requires_grad = True
+                    
+            # 再次更新优化器，使用更小的学习率
+            optimizer = RAdam(
+                filter(lambda p: p.requires_grad, finetune_model.parameters()),
+                lr=lr * 0.1,  # 进一步降低学习率
+                weight_decay=1e-4  # 微调时可以减小权重衰减
+            )
+            
+            # 重置学习率调度器
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, 
+                mode='min', 
+                factor=0.5,
+                patience=5,
+                min_lr=1e-7
+            )
     
     # 训练结束
     writer.close()
-    print(f"微调完成。最佳验证损失: {best_val_loss:.4f}")
+    print(f"微调完成。最佳验证损失: {best_val_loss:.4f}，出现在第 {best_epoch+1}/{num_epochs} 轮")
 
     # 也保存最后一个模型
     torch.save(finetune_model.state_dict(), os.path.join(save_dir, "final_model.pth"))
@@ -755,9 +815,9 @@ if __name__ == "__main__":
             pretrained_path=ava_pretrained_path,
             baid_data_path=baid_data_path,   
             save_dir=save_dir,
-            num_epochs=200,
+            num_epochs=35,
             batch_size=32,
-            lr=5e-5,
+            lr = 1e-4,
             if_continue=False
         )
     elif args.mode == 'validate':

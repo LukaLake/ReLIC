@@ -90,7 +90,7 @@ class NIMA_Finetune(nn.Module):
         # 新的BAID输出头
         self.baid_head = nn.Sequential(
             nn.ReLU(),
-            nn.Dropout(p=0.5),  # 可以调整dropout率
+            nn.Dropout(p=0.75),  # 可以调整dropout率
             nn.Linear(3681, 1),  # 输出单值
             nn.Sigmoid()  # 输出范围为[0,1]
         )
