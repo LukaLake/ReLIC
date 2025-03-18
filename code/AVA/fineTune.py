@@ -67,7 +67,6 @@ def print_model_layers(model):
 
 
 
-
 def finetune_on_baid(pretrained_path, baid_data_path, save_dir, num_epochs=20, batch_size=32, lr = 1e-4 , if_continue=False):
     """
     在BAID数据集上微调NIMA模型
@@ -318,6 +317,384 @@ def finetune_on_baid(pretrained_path, baid_data_path, save_dir, num_epochs=20, b
     
     # 返回微调后的模型
     return finetune_model
+
+
+def finetune_on_mixed_datasets(pretrained_path, baid_data_path, ava_csv_path, ava_images_path, 
+                               save_dir, num_epochs=35, batch_size=32, lr=1e-4, ava_weight=0.5,
+                               if_continue=False):
+    """
+    在BAID和AVA混合数据集上微调NIMA模型，统一使用BAID头和MSE损失
+    
+    参数:
+        pretrained_path: 预训练NIMA模型路径
+        baid_data_path: BAID数据集路径
+        ava_csv_path: AVA训练集CSV文件路径
+        ava_images_path: AVA图像目录路径
+        save_dir: 保存模型的目录
+        num_epochs: 训练轮数
+        batch_size: 批次大小
+        lr: 学习率
+        ava_weight: AVA数据集样本的比例权重
+        if_continue: 是否从保存的检查点继续训练
+    """
+    # 设备配置
+    opt = option.init()
+    device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
+    
+    # 创建保存目录
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 初始化微调模型并加载预训练权重
+    finetune_model = NIMA_Finetune()
+    finetune_model = load_pretrained_nima(finetune_model, pretrained_path)
+    finetune_model = finetune_model.to(device)
+    
+    # 加载BAID数据集
+    baid_train_dataset = BBDataset(file_dir=baid_data_path, type='train')
+    baid_val_dataset = BBDataset(file_dir=baid_data_path, type='validation')
+    
+    # 加载AVA数据集
+    ava_train_dataset = AVADataset(ava_csv_path, ava_images_path, if_train=True)
+    
+    # 创建混合数据加载器 
+    class MixedDataLoader:
+        def __init__(self, baid_loader, ava_loader, ava_weight=0.5):
+            self.baid_loader = baid_loader
+            self.ava_loader = ava_loader
+            self.ava_weight = ava_weight
+            
+            # 计算每个epoch的批次数
+            self.baid_batches = len(self.baid_loader)
+            self.ava_batches = int(len(self.ava_loader) * self.ava_weight) # 仅使用一部分AVA数据
+            self.total_batches = self.baid_batches + self.ava_batches
+            
+            # 创建迭代器
+            self.reset()
+            
+        def reset(self):
+            """重置迭代器"""
+            self.baid_iter = iter(self.baid_loader)
+            self.ava_iter = iter(self.ava_loader)
+            self.baid_count = 0
+            self.ava_count = 0
+        
+        def __len__(self):
+            return self.total_batches
+            
+        def __iter__(self):
+            return self
+            
+        def __next__(self):
+            # 确定从哪个数据集获取下一个批次
+            if self.baid_count < self.baid_batches:
+                # 从BAID获取
+                try:
+                    batch = next(self.baid_iter)
+                    self.baid_count += 1
+                    if batch is None:
+                        return self.__next__()  # 如果是空批次，递归获取下一个
+                    return {'inputs': batch[0], 'targets': batch[1], 'dataset': 'baid'}
+                except StopIteration:
+                    # 如果BAID已迭代完毕但计数未达到，重置迭代器
+                    self.baid_iter = iter(self.baid_loader)
+                    batch = next(self.baid_iter)
+                    self.baid_count += 1
+                    if batch is None:
+                        return self.__next__()
+                    return {'inputs': batch[0], 'targets': batch[1], 'dataset': 'baid'}
+            elif self.ava_count < self.ava_batches:
+                # 从AVA获取
+                try:
+                    batch = next(self.ava_iter)
+                    self.ava_count += 1
+                    if batch is None:
+                        return self.__next__()
+                    
+                    # 将AVA的分布标签转换为单一分数 (0-1范围)
+                    inputs, targets_dist = batch
+                    # 计算期望分数 (1-10) 然后归一化到 (0-1)
+                    targets_single = torch.sum(targets_dist * torch.arange(1, 11).float(), dim=1) / 10.0
+                    
+                    return {'inputs': inputs, 'targets': targets_single, 'dataset': 'ava'}
+                except StopIteration:
+                    # 如果AVA已迭代完毕但计数未达到，重置迭代器
+                    self.ava_iter = iter(self.ava_loader)
+                    batch = next(self.ava_iter)
+                    self.ava_count += 1
+                    if batch is None:
+                        return self.__next__()
+                    
+                    # 将AVA的分布标签转换为单一分数 (0-1范围)
+                    inputs, targets_dist = batch
+                    # 计算期望分数 (1-10) 然后归一化到 (0-1)
+                    targets_single = torch.sum(targets_dist * torch.arange(1, 11).float(), dim=1) / 10.0
+                    
+                    return {'inputs': inputs, 'targets': targets_single, 'dataset': 'ava'}
+            else:
+                # 两个数据集都迭代完毕
+                raise StopIteration
+    
+    # 创建数据加载器
+    baid_train_loader = DataLoader(
+        baid_train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=opt.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
+    ava_train_loader = DataLoader(
+        ava_train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=opt.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
+    val_loader = DataLoader(
+        baid_val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=opt.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
+    # 创建混合数据加载器
+    mixed_train_loader = MixedDataLoader(baid_train_loader, ava_train_loader, ava_weight)
+    
+    # 训练配置
+    # 第一阶段：只微调baid_head
+    for name, param in finetune_model.named_parameters():
+        if 'baid_head' in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    
+    optimizer = RAdam(
+        filter(lambda p: p.requires_grad, finetune_model.parameters()),
+        lr=lr,
+        weight_decay=1e-3
+    )
+    
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5,  # 每次减半学习率
+        patience=5,  # 5个epoch没有提升就降低学习率
+        min_lr=1e-6
+    )
+    
+    # 损失函数 - 统一使用MSE损失
+    mse_criterion = nn.MSELoss().to(device)
+    
+    # TensorBoard初始化
+    writer = SummaryWriter(log_dir=os.path.join(save_dir, 'logs'))
+    
+    # 训练状态
+    best_val_loss = float('inf')
+    best_epoch = -1
+    start_epoch = 0
+    
+    # 如果继续训练，加载检查点
+    checkpoint_path = os.path.join(save_dir, "checkpoint.pth")
+    if if_continue and os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        finetune_model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint['best_val_loss']
+        print(f"继续训练：从第 {start_epoch} 轮开始")
+    
+    # 训练循环
+    for epoch in range(start_epoch, num_epochs):
+        # 重置混合加载器的迭代器
+        mixed_train_loader.reset()
+        
+        # 训练阶段
+        finetune_model.train()
+        train_loss = 0.0
+        baid_loss_meter = AverageMeter()
+        ava_loss_meter = AverageMeter()
+        batch_count = 0
+        
+        for batch_idx, batch in enumerate(tqdm(mixed_train_loader, desc=f"训练轮次 [{epoch+1}/{num_epochs}]", total=len(mixed_train_loader))):
+            batch_count += 1
+            inputs = batch['inputs'].to(device)
+            targets = batch['targets'].to(device).float()
+            dataset_name = batch['dataset']
+            
+            # 前向传播 - 统一使用BAID头
+            outputs = finetune_model(inputs, mode='baid')
+            loss = mse_criterion(outputs.squeeze(), targets)
+            
+            # 加权损失
+            alpha = 0.7  # BAID任务的权重
+            if dataset_name == 'baid':
+                loss = mse_criterion(outputs.squeeze(), targets)
+                baid_loss_meter.update(loss.item(), inputs.size(0))
+                weighted_loss = alpha * loss
+            else:
+                loss = mse_criterion(outputs.squeeze(), targets)
+                ava_loss_meter.update(loss.item(), inputs.size(0))
+                weighted_loss = (1 - alpha) * loss
+            
+            # 反向传播
+            optimizer.zero_grad()
+            # loss.backward()
+            weighted_loss.backward()
+            torch.nn.utils.clip_grad_norm_(finetune_model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            train_loss += loss.item() * inputs.size(0)
+            
+            # 记录批次级别的训练指标
+            if batch_idx % 20 == 0:
+                writer.add_scalar('Train/Batch_Loss', loss.item(), epoch * len(mixed_train_loader) + batch_idx)
+                writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], epoch * len(mixed_train_loader) + batch_idx)
+                if dataset_name == 'baid':
+                    writer.add_scalar('Train/BAID_Batch_Loss', loss.item(), epoch * len(mixed_train_loader) + batch_idx)
+                else:
+                    writer.add_scalar('Train/AVA_Batch_Loss', loss.item(), epoch * len(mixed_train_loader) + batch_idx)
+        
+        # 计算平均训练损失
+        avg_train_loss = train_loss / batch_count if batch_count > 0 else 0
+        
+        # 验证阶段 (只在BAID验证集上验证)
+        finetune_model.eval()
+        val_loss = 0.0
+        val_preds = []
+        val_targets = []
+        
+        with torch.no_grad():
+            for inputs, targets in tqdm(val_loader, desc="验证中"):
+                if inputs is None:
+                    continue
+                    
+                inputs = inputs.to(device)
+                targets = targets.to(device).float()
+                
+                # 前向传播 (使用BAID模式)
+                outputs = finetune_model(inputs, mode='baid')
+                loss = mse_criterion(outputs.squeeze(), targets)
+                
+                val_loss += loss.item() * inputs.size(0)
+                
+                # 收集预测和目标值，用于计算相关系数
+                val_preds.append(outputs.squeeze().cpu().numpy())
+                val_targets.append(targets.cpu().numpy())
+        
+        # 计算平均验证损失
+        avg_val_loss = val_loss / len(val_loader.dataset) if val_loader.dataset else float('inf')
+        
+        # 计算皮尔逊相关系数和斯皮尔曼相关系数
+        if val_preds and val_targets:
+            val_preds_flat = np.concatenate(val_preds)
+            val_targets_flat = np.concatenate(val_targets)
+            pearson_corr = pearsonr(val_preds_flat, val_targets_flat)[0]
+            spearman_corr = spearmanr(val_preds_flat, val_targets_flat)[0]
+        else:
+            pearson_corr = spearman_corr = 0
+        
+        # 记录每轮的指标
+        writer.add_scalar('Train/Epoch_Loss', avg_train_loss, epoch)
+        writer.add_scalar('Train/BAID_Epoch_Loss', baid_loss_meter.avg, epoch)
+        writer.add_scalar('Train/AVA_Epoch_Loss', ava_loss_meter.avg, epoch)
+        writer.add_scalar('Validation/Loss', avg_val_loss, epoch)
+        writer.add_scalar('Validation/Pearson_Correlation', pearson_corr, epoch)
+        writer.add_scalar('Validation/Spearman_Correlation', spearman_corr, epoch)
+        
+        # 打印训练状态
+        print(f"轮次 [{epoch+1}/{num_epochs}] - "
+              f"训练损失: {avg_train_loss:.4f} (BAID: {baid_loss_meter.avg:.4f}, AVA: {ava_loss_meter.avg:.4f}), "
+              f"验证损失: {avg_val_loss:.4f}, "
+              f"Pearson: {pearson_corr:.4f}, "
+              f"Spearman: {spearman_corr:.4f}")
+        
+        # 保存检查点，用于恢复训练
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': finetune_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'val_pearson': pearson_corr,
+            'val_spearman': spearman_corr
+        }, checkpoint_path)
+        
+        # 如果当前模型是最佳模型，保存它
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_epoch = epoch  # 记录最佳epoch
+            torch.save(finetune_model.state_dict(), os.path.join(save_dir, "best_model.pth"))
+            print(f"保存最佳模型，验证损失: {best_val_loss:.4f}")
+        
+        # 更新学习率
+        scheduler.step(avg_val_loss)
+        
+        # 分阶段训练策略
+        if epoch == 10:
+            print("第二阶段：解冻FC层和基础模型的最后几层")
+            for name, param in finetune_model.named_parameters():
+                # 解冻所有fc层、baid_head及基础模型的最后一些层
+                if any(x in name for x in ['fc', 'baid_head', 'base_model.model.8', 'base_model.model.9']):
+                    param.requires_grad = True
+            
+            # 更新优化器以包含解冻的参数
+            optimizer = RAdam(
+                filter(lambda p: p.requires_grad, finetune_model.parameters()),
+                lr=lr * 0.5,  # 降低学习率
+                weight_decay=1e-3
+            )
+            
+            # 重置学习率调度器
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, 
+                mode='min', 
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6
+            )
+
+        # # 第三阶段
+        # if epoch == 20:
+        #     print("第三阶段：解冻更多基础模型层")
+        #     for name, param in finetune_model.named_parameters():
+        #         # # 解冻基础模型的更多层，但保留前几层冻结
+        #         # if 'base_model.model.0' not in name and 'base_model.model.1' not in name:
+        #         #     param.requires_grad = True
+        #         param.requires_grad = True
+                
+                    
+        #     # 再次更新优化器，使用更小的学习率
+        #     optimizer = RAdam(
+        #         filter(lambda p: p.requires_grad, finetune_model.parameters()),
+        #         lr=lr * 0.1,  # 进一步降低学习率
+        #         weight_decay=1e-4  # 微调时可以减小权重衰减
+        #     )
+            
+        #     # 重置学习率调度器
+        #     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #         optimizer, 
+        #         mode='min', 
+        #         factor=0.5,
+        #         patience=5,
+        #         min_lr=1e-7
+        #     )
+    
+    # 训练结束
+    writer.close()
+    print(f"微调完成。最佳验证损失: {best_val_loss:.4f}，出现在第 {best_epoch+1}/{num_epochs} 轮")
+
+    # 也保存最后一个模型
+    torch.save(finetune_model.state_dict(), os.path.join(save_dir, "final_model.pth"))
+    
+    return finetune_model
+
+
 
 
 def pred_single_finetuned(model_path, image_path, original_model_path=None, device=None):
@@ -781,16 +1158,29 @@ if __name__ == "__main__":
     baid_data_path = r"D:\Datasets\BAID"
     baid_data_dir = r"D:\Datasets\BAID\validation"
     save_dir = r"C:\Users\Administrator\Documents\GitHub\ReLIC\code\AVA\finetune_models"
+
+    opt=option.init()
     
     # 执行微调或预测
     import argparse
     parser = argparse.ArgumentParser(description='NIMA模型微调与预测')
-    parser.add_argument('--mode', type=str, default='train', 
-                        choices=['train', 'predict', 'batch', 'validate'], 
+    parser.add_argument('--mode', type=str, default='train_mixed', 
+                        choices=['train', 'train_mixed', 'predict', 'batch', 'validate'], 
                         help='运行模式: train (微调), predict (单图预测), batch (批量预测), validate (验证对比)')
     parser.add_argument('--ava_val_csv', type=str, 
-                        default=os.path.join(option.init().path_to_save_csv, 'val.csv'),
+                        default=os.path.join(opt.path_to_save_csv, 'val.csv'),
                         help='AVA验证集CSV路径')
+    parser.add_argument('--ava_train_csv', type=str, 
+                    default=os.path.join(opt.path_to_save_csv, 'train.csv'),
+                    help='AVA训练集CSV路径')
+    parser.add_argument('--ava_images_path', type=str, 
+                        default=opt.path_to_images,
+                        help='AVA图像目录路径')
+    parser.add_argument('--ava_weight', type=float, default=0.5,
+                        help='混合训练中AVA数据集的权重')
+    parser.add_argument('--mixed_save_dir', type=str,
+                        default=os.path.join(os.path.dirname(save_dir), 'finetune_models_mixed'),
+                        help='混合训练模型的保存目录')
     parser.add_argument('--baid_data_path', type=str, 
                     default=baid_data_path, 
                     help='BAID数据集根目录路径')
@@ -800,7 +1190,7 @@ if __name__ == "__main__":
                     default=ava_pretrained_path, 
                     help='原始NIMA模型路径')
     parser.add_argument('--image_path', type=str, 
-                        default=r'C:\Users\Administrator\Documents\GitHub\ReLIC\Images\69.jpg', 
+                        default=r'C:\Users\Administrator\Documents\GitHub\ReLIC\Images\Test12.png', 
                         help='预测单张图像的路径')
     parser.add_argument('--image_dir', type=str, 
                         help='批量预测的图像目录')
@@ -818,6 +1208,20 @@ if __name__ == "__main__":
             num_epochs=35,
             batch_size=32,
             lr = 1e-4,
+            if_continue=False
+        )
+    elif args.mode == 'train_mixed':
+        # 执行混合数据集微调
+        finetune_on_mixed_datasets(
+            pretrained_path=args.original_model_path,
+            baid_data_path=args.baid_data_path,
+            ava_csv_path=args.ava_train_csv,
+            ava_images_path=args.ava_images_path,
+            save_dir=args.mixed_save_dir,
+            num_epochs=35,
+            batch_size=32,
+            lr=1e-4,
+            ava_weight=args.ava_weight,
             if_continue=False
         )
     elif args.mode == 'validate':
