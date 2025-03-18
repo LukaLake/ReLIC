@@ -11,7 +11,7 @@ def init():
     parser.add_argument('--path_to_test_images', type=str, default=r'C:\Users\Administrator\Documents\GitHub\ReLIC\Images',
                         help='directory to images for prediction')
     
-    parser.add_argument('--image_name', type=str, default='Test7.png',
+    parser.add_argument('--image_name', type=str, default='Test12.png',
                         help='image name')
 
     parser.add_argument('--path_to_save_csv', type=str,default=r"C:\Users\Administrator\Documents\GitHub\ReLIC/data/AVA/",
@@ -31,7 +31,7 @@ def init():
 
     parser.add_argument('--init_lr', type=int, default=0.00003, help='learning_rate'
                         )
-    parser.add_argument('--num_epoch', type=int, default=20, help='epoch num for train'
+    parser.add_argument('--num_epoch', type=int, default=80, help='epoch num for train'
                         )
     parser.add_argument('--batch_size', type=int,default=16,help='how many pictures to process one time'
                         )

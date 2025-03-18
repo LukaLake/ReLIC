@@ -10,6 +10,7 @@ from dataset import AVADataset
 from torch.utils.data import DataLoader
 from torchvision.datasets.folder import default_loader
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 from tqdm import tqdm
 import numpy as np
 from torchvision import transforms
@@ -544,6 +545,212 @@ def get_score(opt,y_pred):
     return score, score_np
 
 
+def validate_models(student_path=None):
+    """
+    验证并比较教师模型和学生模型的性能
+    
+    参数:
+        student_path: 学生模型权重路径，默认使用配置中的路径
+    
+    返回:
+        包含各项指标的字典
+    """
+    import time
+    from scipy.stats import pearsonr, spearmanr
+    import matplotlib.pyplot as plt
+    
+    opt = option.init()
+    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
+    
+    # 初始化模型
+    teacher = init_teacher_model(opt)
+    student = init_student_model(opt)
+    
+    # 加载学生模型权重
+    if student_path:
+        student.load_state_dict(torch.load(student_path, map_location=opt.device))
+    else:
+        student.load_state_dict(torch.load(opt.path_to_student_model_weight, map_location=opt.device))
+    
+    # 准备验证数据
+    _, val_loader, test_loader = create_data_part(opt)
+    
+    # 结果收集器
+    results = {
+        'teacher_preds': [],
+        'student_preds': [],
+        'targets': [],
+        'teacher_times': [],
+        'student_times': [],
+        'teacher_scores': [],
+        'student_scores': []
+    }
+    
+    # 设置评估模式
+    teacher.eval()
+    student.eval()
+    
+    # 在验证集上评估
+    with torch.no_grad():
+        for images, targets in tqdm(val_loader, desc="Validating"):
+            if images is None:
+                continue
+                
+            images = images.to(opt.device)
+            targets = targets.to(opt.device)
+            
+            # 教师模型推理（测量时间）
+            torch.cuda.synchronize()
+            t_start = time.time()
+            t_preds = teacher(images)
+            torch.cuda.synchronize()
+            t_end = time.time()
+            
+            # 学生模型推理（测量时间）
+            torch.cuda.synchronize()
+            s_start = time.time()
+            _, _, _, s_preds = student(images)
+            torch.cuda.synchronize()
+            s_end = time.time()
+            
+            # 转换为质量分数
+            _, t_scores = get_score(opt, t_preds)
+            _, s_scores = get_score(opt, s_preds)
+            
+            # 收集结果
+            results['teacher_preds'].append(t_preds.cpu().numpy())
+            results['student_preds'].append(s_preds.cpu().numpy())
+            results['targets'].append(targets.cpu().numpy())
+            results['teacher_times'].append((t_end - t_start) * 1000)  # 转换为毫秒
+            results['student_times'].append((s_end - s_start) * 1000)  # 转换为毫秒
+            results['teacher_scores'].append(t_scores)
+            results['student_scores'].append(s_scores)
+    
+    # 合并批次结果
+    results['teacher_preds'] = np.concatenate(results['teacher_preds'])
+    results['student_preds'] = np.concatenate(results['student_preds'])
+    results['targets'] = np.concatenate(results['targets'])
+    results['teacher_scores'] = np.concatenate(results['teacher_scores'])
+    results['student_scores'] = np.concatenate(results['student_scores'])
+    
+    # 计算平均推理时间
+    avg_teacher_time = np.mean(results['teacher_times'])
+    avg_student_time = np.mean(results['student_times'])
+    speedup = avg_teacher_time / avg_student_time
+    
+    # 计算目标评分（用于相关性计算）
+    target_scores = np.sum(results['targets'] * np.arange(1, 11), axis=1) / 10
+    
+    # 计算评估指标
+    metrics = {}
+    
+    # EMD (Earth Mover's Distance) - 分布差异
+    def calculate_emd(p, q):
+        return np.mean(np.abs(np.cumsum(p) - np.cumsum(q)))
+    
+    t_emd = np.mean([calculate_emd(p, t) for p, t in zip(results['targets'], results['teacher_preds'])])
+    s_emd = np.mean([calculate_emd(p, t) for p, t in zip(results['targets'], results['student_preds'])])
+    
+    # 相关系数
+    t_pearson = pearsonr(results['teacher_scores'], target_scores)[0]
+    s_pearson = pearsonr(results['student_scores'], target_scores)[0]
+    t_spearman = spearmanr(results['teacher_scores'], target_scores)[0]
+    s_spearman = spearmanr(results['student_scores'], target_scores)[0]
+    
+    # 学生与教师之间的相关性
+    st_pearson = pearsonr(results['student_scores'], results['teacher_scores'])[0]
+    st_spearman = spearmanr(results['student_scores'], results['teacher_scores'])[0]
+    
+    # 计算MSE
+    t_mse = np.mean((results['teacher_scores'] - target_scores) ** 2)
+    s_mse = np.mean((results['student_scores'] - target_scores) ** 2)
+    
+    # 保存指标
+    metrics['emd'] = {'teacher': t_emd, 'student': s_emd}
+    metrics['pearson'] = {'teacher': t_pearson, 'student': s_pearson}
+    metrics['spearman'] = {'teacher': t_spearman, 'student': s_spearman}
+    metrics['mse'] = {'teacher': t_mse, 'student': s_mse}
+    metrics['student_teacher'] = {'pearson': st_pearson, 'spearman': st_spearman}
+    metrics['time'] = {'teacher': avg_teacher_time, 'student': avg_student_time, 'speedup': speedup}
+    
+    # 计算模型大小
+    def get_model_size_mb(model):
+        param_size = 0
+        for param in model.parameters():
+            param_size += param.nelement() * param.element_size()
+        buffer_size = 0
+        for buffer in model.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+        size_mb = (param_size + buffer_size) / 1024 / 1024
+        return size_mb
+    
+    t_size = get_model_size_mb(teacher)
+    s_size = get_model_size_mb(student)
+    size_reduction = (t_size - s_size) / t_size * 100
+    
+    metrics['size'] = {'teacher': t_size, 'student': s_size, 'reduction': size_reduction}
+    
+    # 打印详细结果
+    print("\n" + "="*50)
+    print("模型性能比较")
+    print("="*50)
+    
+    print(f"\n推理性能比较:")
+    print(f"平均推理时间 - 教师: {avg_teacher_time:.2f}ms, 学生: {avg_student_time:.2f}ms")
+    print(f"加速比: {speedup:.2f}x")
+    print(f"模型大小 - 教师: {t_size:.2f}MB, 学生: {s_size:.2f}MB")
+    print(f"大小减少: {size_reduction:.1f}%")
+    
+    print(f"\n预测质量比较:")
+    print(f"目标相关性 (Pearson) - 教师: {t_pearson:.4f}, 学生: {s_pearson:.4f}")
+    print(f"目标相关性 (Spearman) - 教师: {t_spearman:.4f}, 学生: {s_spearman:.4f}")
+    print(f"分布差异 (EMD) - 教师: {t_emd:.4f}, 学生: {s_emd:.4f}")
+    print(f"MSE - 教师: {t_mse:.4f}, 学生: {s_mse:.4f}")
+    
+    print(f"\n学生-教师一致性:")
+    print(f"教师-学生相关性 (Pearson): {st_pearson:.4f}")
+    print(f"教师-学生相关性 (Spearman): {st_spearman:.4f}")
+    
+    # 创建比较散点图
+    plt.figure(figsize=(15, 5))
+    
+    # 教师 vs 目标
+    plt.subplot(1, 3, 1)
+    plt.scatter(target_scores, results['teacher_scores'], alpha=0.5, s=10)
+    plt.plot([1, 10], [1, 10], 'r--')
+    plt.xlabel('目标评分')
+    plt.ylabel('教师模型预测')
+    plt.title(f'教师 vs 目标 (Pearson={t_pearson:.3f})')
+    
+    # 学生 vs 目标
+    plt.subplot(1, 3, 2)
+    plt.scatter(target_scores, results['student_scores'], alpha=0.5, s=10)
+    plt.plot([1, 10], [1, 10], 'r--')
+    plt.xlabel('目标评分')
+    plt.ylabel('学生模型预测')
+    plt.title(f'学生 vs 目标 (Pearson={s_pearson:.3f})')
+    
+    # 学生 vs 教师
+    plt.subplot(1, 3, 3)
+    plt.scatter(results['teacher_scores'], results['student_scores'], alpha=0.5, s=10)
+    plt.plot([1, 10], [1, 10], 'r--')
+    plt.xlabel('教师模型预测')
+    plt.ylabel('学生模型预测')
+    plt.title(f'学生 vs 教师 (Pearson={st_pearson:.3f})')
+    
+    plt.tight_layout()
+    
+    # 保存图表
+    save_dir = os.path.join(os.path.dirname(__file__), "trained_models")
+    os.makedirs(save_dir, exist_ok=True)
+    plt.savefig(os.path.join(save_dir, 'model_comparison.png'), dpi=300)
+    plt.close()
+    
+    print(f"\n可视化结果已保存至 {os.path.join(save_dir, 'model_comparison.png')}")
+    
+    return metrics
+
+
 # 修改后的预测函数
 def pred_single():
     opt = option.init()
@@ -724,3 +931,4 @@ def pred_single_with_time():
 if __name__ == "__main__":
     train_efficient_student(False)
     # pred_single_with_time()
+    # validate_models()  # 运行模型验证比较
