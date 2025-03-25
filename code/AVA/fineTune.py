@@ -1156,7 +1156,6 @@ if __name__ == "__main__":
     # 配置参数
     ava_pretrained_path = r"C:\Users\Administrator\Documents\GitHub\ReLIC\code\AVA\pretrain_model\relic2_model.pth"
     baid_data_path = r"D:\Datasets\BAID"
-    baid_data_dir = r"D:\Datasets\BAID\validation"
     save_dir = r"C:\Users\Administrator\Documents\GitHub\ReLIC\code\AVA\finetune_models"
 
     opt=option.init()

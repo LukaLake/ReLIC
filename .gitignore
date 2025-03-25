@@ -133,6 +133,6 @@ dmypy.json
 *.onnx
 *.pth
 
-code/AVA/trained_models/logs/*
-code/AVA/finetune_models/logs/*
-code/AVA/finetune_models_mixed/logs/*
+code/AVA/trained_models/
+code/AVA/finetune_models/
+code/AVA/finetune_models_mixed/
