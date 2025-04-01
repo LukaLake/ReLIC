@@ -258,7 +258,9 @@ class LightNIMA(nn.Module):
         
         # 使用与原始cat_net相同的基础模型构建方式
         from torchvision import models
-        base_model = models.mobilenet_v2(pretrained=True)
+        # 新式写法
+        from torchvision.models import MobileNet_V2_Weights
+        base_model = models.mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1)
         
         # try:
         #     state_dict = torch.load(local_weights_path, map_location='cpu')
@@ -281,7 +283,7 @@ class LightNIMA(nn.Module):
             dummy_input = torch.zeros(1, 3, 224, 224)
             feat_output = self.base_model(dummy_input)
             out_channels = feat_output.size(1)
-            print(f"MobileNetV2前9层输出通道数: {out_channels}")
+            # print(f"MobileNetV2前9层输出通道数: {out_channels}")
         
         # 2. 保持与原始NIMA一致的SA层和自注意力架构，但使用正确的通道数
         self.sa = nn.Sequential(
@@ -477,8 +479,8 @@ class NIMADistillLoss(nn.Module):
         return total_loss
     
 
-class NIMADistillLossForLiteNIMA(nn.Module):
-    def __init__(self, alpha=0.5, temp=2.0, gamma=0.3, beta=0.2):
+# class NIMADistillLossForLiteNIMA(nn.Module):
+    def __init__(self, alpha=0.5, temp=2.0):
         super().__init__()
         self.alpha = alpha  # KL损失权重
         self.temp = temp    # 温度参数
@@ -506,9 +508,14 @@ class NIMADistillLossForLiteNIMA(nn.Module):
         
         # ===== 1. KL散度损失 - 软目标蒸馏 =====
         try:
+            # 在计算KL散度损失前添加更强的预处理
+            # 对logits进行裁剪，防止极端值
+            t_output_clipped = torch.clamp(t_output, -20, 20)  # 限制范围防止exp溢出
+            s_output_clipped = torch.clamp(s_output, -20, 20)  # 限制范围防止exp溢出
+
             # 添加数值稳定性保护
-            t_probs = F.softmax(t_output / self.temp, dim=1).clamp(min=1e-7)
-            s_log_probs = F.log_softmax(s_output / self.temp, dim=1)
+            t_probs = F.softmax(t_output_clipped / self.temp, dim=1).clamp(min=1e-7, max=0.999)
+            s_log_probs = F.log_softmax(s_output_clipped / self.temp, dim=1)
             
             # 计算KL散度损失
             loss_kl = self.kl_loss(s_log_probs, t_probs) * (self.temp**2)
@@ -627,6 +634,77 @@ class NIMADistillLossForLiteNIMA(nn.Module):
         return total_loss
 
 
+class NIMADistillLossForLiteNIMA(nn.Module):
+    """使用更简单、更稳定的损失函数组合"""
+    
+    def __init__(self, alpha=0.7, beta=0.3):
+        super().__init__()
+        self.alpha = alpha  # 输出分布损失权重
+        self.beta = beta    # 注意力图损失权重
+        self.mse_loss = nn.MSELoss()
+        self.l1_loss = nn.L1Loss()
+        
+    def forward(self, teacher, student, inputs):
+        # 教师前向传播
+        with torch.no_grad():
+            t_output = teacher(inputs)
+            t_base, t_sa = teacher.base_model(inputs)
+        
+        # 学生前向传播
+        s_output = student(inputs)
+        
+        # 获取学生模型的注意力图
+        x_feat = student.base_model(inputs)
+        x_sa = student.sa(x_feat)
+        s_attn = student.get_attention_map(x_sa)
+        
+        # 1. 简单分布损失 - 使用MSE代替KL散度
+        # 将logits转换为概率分布
+        t_probs = F.softmax(t_output, dim=1)
+        s_probs = F.softmax(s_output, dim=1)
+        
+        # 直接使用MSE计算分布差异
+        loss_dist = self.mse_loss(s_probs, t_probs)
+        
+        # 2. 注意力图对齐 - 简化版
+        try:
+            # 展平注意力图
+            s_attn_flat = s_attn.view(s_attn.size(0), -1)
+            t_sa_flat = t_sa.view(t_sa.size(0), -1)
+            
+            # 处理维度不匹配
+            if s_attn_flat.shape[1] != t_sa_flat.shape[1]:
+                min_dim = min(s_attn_flat.shape[1], t_sa_flat.shape[1])
+                s_attn_flat = s_attn_flat[:, :min_dim]
+                t_sa_flat = t_sa_flat[:, :min_dim]
+                
+            # 使用L1损失代替MSE - 更不容易受异常值影响
+            loss_attn = self.l1_loss(s_attn_flat, t_sa_flat)
+        except Exception:
+            # 兜底值
+            loss_attn = torch.tensor(0.1, device=inputs.device, requires_grad=True)
+        
+        # 组合损失
+        try:
+            total_loss = self.alpha * loss_dist + self.beta * loss_attn
+            
+            # 安全检查
+            if not torch.isfinite(total_loss):
+                print("总损失仍然为NaN，使用最基本的MSE")
+                # 完全回退到基本MSE
+                total_loss = self.mse_loss(s_probs, t_probs)
+            
+            # 限制损失范围避免梯度爆炸
+            total_loss = torch.clamp(total_loss, 0.0, 10.0)
+        except Exception:
+            # 最安全的兜底方案
+            zero_tensor = torch.zeros(1, device=inputs.device, requires_grad=True)
+            safe_loss = torch.ones(1, device=inputs.device, requires_grad=True)
+            total_loss = safe_loss * 0.1 + zero_tensor
+            
+        return total_loss
+    
+
 # 自定义数据加载器以过滤掉 None 值
 def collate_fn(batch):
     batch = list(filter(lambda x: x is not None, batch))
@@ -671,7 +749,7 @@ def create_data_part(opt):
 def init_teacher_model(opt):
     teacher = NIMA().eval()
     teacher.load_state_dict(
-        torch.load(opt.path_to_teacher_model_weight, map_location=opt.device)
+        torch.load(opt.path_to_teacher_model_weight, map_location=opt.device,weights_only=False)
     )
     return teacher.to(opt.device)
 
@@ -713,6 +791,19 @@ def get_image_ground_truth(image_id, csv_path):
     mean_score = np.sum(normalized_dist * np.arange(2, 12)) 
     
     return normalized_dist, mean_score
+
+
+def get_score(opt, y_pred):
+    # 修改为使用 2-11 的权重
+    w = torch.from_numpy(np.linspace(2, 11, 10))  # 从 2 到 11，而不是 1 到 10
+    w = w.type(torch.FloatTensor)
+    w = w.to(opt.device)
+
+    w_batch = w.repeat(y_pred.size(0), 1)
+
+    score = (y_pred * w_batch).sum(dim=1)
+    score_np = score.data.cpu().numpy()
+    return score, score_np
 
 
 def query_image_label(opt, image_id=None):
@@ -1064,7 +1155,7 @@ def train_lite_nima(if_continue=False, run_name=None):
     # 优化器配置
     optimizer = torch.optim.AdamW(
         student.parameters(),
-        lr=opt.init_lr * 0.8,  # 稍微降低学习率以提高稳定性
+        lr=opt.init_lr * 0.1,  # 稍微降低学习率以提高稳定性
         weight_decay=1e-5
     )
 
@@ -1080,7 +1171,7 @@ def train_lite_nima(if_continue=False, run_name=None):
     scaler = torch.cuda.amp.GradScaler(enabled=True)
     
     # 创建LightNIMA专用的蒸馏损失
-    criterion = NIMADistillLossForLiteNIMA(alpha=0.3, temp=2.0, gamma=0.5, beta=0.2)
+    criterion = NIMADistillLossForLiteNIMA()
     
     # 训练监控
     best_emd = float('inf')
@@ -1111,13 +1202,6 @@ def train_lite_nima(if_continue=False, run_name=None):
         
         return alpha
     
-    # 定义温度调整函数
-    def adjust_temperature(epoch, max_epochs):
-        # 温度从高到低，使得后期预测更加"锐利"
-        min_temp = 1.5
-        max_temp = 3.0
-        return max_temp - (max_temp - min_temp) * (epoch / max_epochs)
-    
     # 定义用于重置 AMP 状态的辅助函数
     def reset_amp_state():
         """重置 AMP 状态以恢复从 NaN/Inf 错误"""
@@ -1132,15 +1216,15 @@ def train_lite_nima(if_continue=False, run_name=None):
         train_loss = 0.0
         
         # 动态调整权重和温度
-        alpha = adjust_loss_weights(epoch, opt.num_epoch)
-        temp = adjust_temperature(epoch, opt.num_epoch)
-        
+        alpha = adjust_loss_weights(epoch, opt.num_epoch)     
         criterion.alpha = alpha
-        criterion.temp = temp
         
         writer.add_scalar('Parameters/Alpha', alpha, epoch)
-        writer.add_scalar('Parameters/Temperature', temp, epoch)
         
+        # 在训练循环中
+        nan_counter = 0  # 跟踪连续NaN批次
+        max_nan_before_lr_reduction = 3  # 连续3个NaN批次后降低学习率
+
         # 训练阶段
         for batch_idx, (images, _) in enumerate(tqdm(train_loader, desc=f"训练 Epoch [{epoch+1}/{opt.num_epoch}]")):
             images = images.to(opt.device, non_blocking=True)
@@ -1151,20 +1235,38 @@ def train_lite_nima(if_continue=False, run_name=None):
                 with torch.cuda.amp.autocast():
                     loss = criterion(teacher, student, images)
                 
-                # 直接检查损失有效性
+                # NaN检查
                 if not torch.isfinite(loss):
-                    print(f"警告: 损失为NaN或Inf，跳过此批次")
-                    scaler = reset_amp_state()  # 重置 scaler
+                    print(f"警告: 批次{batch_idx}损失为NaN，跳过")
+                    nan_counter += 1
+                    
+                    # 连续多个NaN后降低学习率
+                    if nan_counter >= max_nan_before_lr_reduction:
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] *= 0.5  # 将学习率降低一半
+                        print(f"连续{nan_counter}个NaN批次，学习率降为{optimizer.param_groups[0]['lr']}")
+                        nan_counter = 0  # 重置计数器
+                        
+                    optimizer.zero_grad()
+                    scaler = torch.cuda.amp.GradScaler(enabled=True)  # 彻底重置scaler
                     continue
+                    
+                # 正常批次，重置计数器
+                nan_counter = 0
                 
                 # 正常反向传播流程
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 
                 # 尝试 unscale 以进行梯度裁剪
+                # 在混合精度训练中，GradScaler 主要解决的是梯度下溢问题。它的工作流程是：
+                # 使用 FP16（半精度）进行前向和反向传播，加速计算
+                # 在反向传播前，通过 scaler.scale(loss) 对损失进行放大，避免梯度过小而变为零
+                # 在优化器更新参数前，需要通过 scaler.unscale_(optimizer) 将梯度缩小回原始尺度
                 try:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+                    # 将梯度裁剪值从 1.0 降低到 0.5，大幅减少梯度爆炸的可能性
+                    torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=0.5)
                 except RuntimeError as e:
                     print(f"unscale_ 失败: {e}, 重置状态")
                     scaler = reset_amp_state()
@@ -1299,17 +1401,7 @@ def train_lite_nima(if_continue=False, run_name=None):
     return student
 
 
-def get_score(opt, y_pred):
-    # 修改为使用 2-11 的权重
-    w = torch.from_numpy(np.linspace(2, 11, 10))  # 从 2 到 11，而不是 1 到 10
-    w = w.type(torch.FloatTensor)
-    w = w.to(opt.device)
 
-    w_batch = w.repeat(y_pred.size(0), 1)
-
-    score = (y_pred * w_batch).sum(dim=1)
-    score_np = score.data.cpu().numpy()
-    return score, score_np
 
 
 def validate_models(student_path=None):
@@ -1943,368 +2035,6 @@ def validate_lite_nima_on_baid(opt, model_path=None, baid_data_path=None, batch_
     return metrics
 
 
-# 修改后的预测函数
-def pred_single():
-    opt = option.init()
-    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
-    
-    # 初始化模型
-    teacher = init_teacher_model(opt)
-    student = init_student_model(opt)
-    student.load_state_dict(torch.load(opt.path_to_student_model_weight, map_location=opt.device))
-    
-    # 预处理（与训练保持一致）
-    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
-    IMAGE_NET_STD = [0.229, 0.224, 0.225]
-    normalize = transforms.Normalize(
-            mean=IMAGE_NET_MEAN,
-            std=IMAGE_NET_STD)
-    transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            normalize])
-    
-    # 加载图像
-    image_path = os.path.join(opt.path_to_test_images, opt.image_name)
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Image not found: {image_path}")
-    
-    try:
-        image = default_loader(image_path)
-        x = transform(image).unsqueeze(0).to(opt.device)
-    except Exception as e:
-        print(f"Error processing image: {str(e)}")
-        return
-
-    # 预测并计算质量分数
-    with torch.no_grad():
-        teacher_pred = teacher(x)
-        _,_, _,student_pred = student(x)
-    
-    # 转换为质量分数（1-10分）
-    def calculate_mean_score(pred):
-        scores = torch.nn.functional.softmax(pred, dim=1)
-        return (scores * torch.arange(2, 12, device=pred.device)).sum(dim=1)
-    
-    _, teacher_score = get_score(opt, teacher_pred)
-    _, student_score = get_score(opt, student_pred)
-
-    print(f"[Teacher] Predicted score: {teacher_score[0]:.2f}")
-    print(f"[Student] Predicted score: {student_score[0]:.2f}")
-
-
-def pred_single_with_time():
-    import os  # 确保在函数内部可以访问os模块
-    opt = option.init()
-    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
-    
-    # 初始化模型
-    teacher = init_teacher_model(opt)
-    student = init_student_model(opt)
-    # student.load_state_dict(torch.load(opt.path_to_student_model_weight, map_location=opt.device))
-    
-    # 预处理（与训练保持一致）
-    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
-    IMAGE_NET_STD = [0.229, 0.224, 0.225]
-    normalize = transforms.Normalize(
-            mean=IMAGE_NET_MEAN,
-            std=IMAGE_NET_STD)
-    transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            normalize])
-    
-    # 加载图像
-    image_path = os.path.join(opt.path_to_test_images, opt.image_name)
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Image not found: {image_path}")
-    
-    try:
-        image = default_loader(image_path)
-        x = transform(image).unsqueeze(0).to(opt.device)
-    except Exception as e:
-        print(f"Error processing image: {str(e)}")
-        return
-
-    # 预热运行 - 消除首次推理的额外开销
-    with torch.no_grad():
-        for _ in range(3):  # 预热3次
-            _ = teacher(x)
-            _, _, _, _ = student(x)
-    
-    # 教师模型推理时间测量
-    teacher_times = []
-    with torch.no_grad():
-        for _ in range(10):  # 运行10次取平均值
-            torch.cuda.synchronize()  # 确保GPU操作完成
-            start_time = torch.cuda.Event(enable_timing=True)
-            end_time = torch.cuda.Event(enable_timing=True)
-            
-            start_time.record()
-            teacher_pred = teacher(x)
-            end_time.record()
-            
-            torch.cuda.synchronize()
-            teacher_times.append(start_time.elapsed_time(end_time))
-    
-    # 学生模型推理时间测量
-    student_times = []
-    with torch.no_grad():
-        for _ in range(10):  # 运行10次取平均值
-            torch.cuda.synchronize()
-            start_time = torch.cuda.Event(enable_timing=True)
-            end_time = torch.cuda.Event(enable_timing=True)
-            
-            start_time.record()
-            _, _, _, student_pred = student(x)
-            end_time.record()
-            
-            torch.cuda.synchronize()
-            student_times.append(start_time.elapsed_time(end_time))
-    
-    # 计算平均时间
-    avg_teacher_time = sum(teacher_times) / len(teacher_times)
-    avg_student_time = sum(student_times) / len(student_times)
-    speedup = avg_teacher_time / avg_student_time
-    
-    # 转换为质量分数（1-10分）
-    _, teacher_score = get_score(opt, teacher_pred)
-    _, student_score = get_score(opt, student_pred)
-    score_diff = abs(teacher_score[0] - student_score[0])
-
-    print(f"[Teacher] Predicted score: {teacher_score[0]:.2f}, Avg. Inference Time: {avg_teacher_time:.2f} ms")
-    print(f"[Student] Predicted score: {student_score[0]:.2f}, Avg. Inference Time: {avg_student_time:.2f} ms")
-    print(f"Score difference: {score_diff:.4f}")
-    print(f"Speedup ratio: {speedup:.2f}x faster")
-    
-    # 如果是CPU模式，还可以计算内存使用情况
-    if opt.device.type == "cpu":
-        import psutil
-        
-        def get_model_size_mb(model):
-            param_size = 0
-            for param in model.parameters():
-                param_size += param.nelement() * param.element_size()
-            buffer_size = 0
-            for buffer in model.buffers():
-                buffer_size += buffer.nelement() * buffer.element_size()
-            size_mb = (param_size + buffer_size) / 1024 / 1024
-            return size_mb
-        
-        teacher_size = get_model_size_mb(teacher)
-        student_size = get_model_size_mb(student)
-        
-        process = psutil.Process(os.getpid())  # 注意这里的os必须在函数顶部导入
-        
-        # 强制进行垃圾回收
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        # 测量教师模型推理时的内存使用
-        before_teacher = process.memory_info().rss / (1024 * 1024)
-        _ = teacher(x)
-        after_teacher = process.memory_info().rss / (1024 * 1024)
-        teacher_memory = after_teacher - before_teacher
-        
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        # 测量学生模型推理时的内存使用
-        before_student = process.memory_info().rss / (1024 * 1024)
-        _, _, _, _ = student(x)
-        after_student = process.memory_info().rss / (1024 * 1024)
-        student_memory = after_student - before_student
-        
-        print(f"Model Size - Teacher: {teacher_size:.2f} MB, Student: {student_size:.2f} MB")
-        print(f"Memory Usage - Teacher: {teacher_memory:.2f} MB, Student: {student_memory:.2f} MB")
-        print(f"Size reduction: {(1 - student_size/teacher_size)*100:.1f}%")
-
-
-def pred_single_with_time_lite_nima():
-    """
-    使用 LightNIMA 模型对单张图像进行预测，并测量推理时间与原始 NIMA 模型进行比较
-    """
-    import os
-    opt = option.init()
-    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
-    
-    # 初始化模型
-    teacher = init_teacher_model(opt)
-    lite_nima = LightNIMA().to(opt.device)
-    
-    # 加载 LightNIMA 模型权重
-    lite_nima_path = os.path.join(os.path.dirname(__file__), "trained_models", "lite_nima", "lite_nima_best.pth")
-    if os.path.exists(lite_nima_path):
-        lite_nima.load_state_dict(torch.load(lite_nima_path, map_location=opt.device))
-        print(f"成功加载 LightNIMA 模型权重: {lite_nima_path}")
-    else:
-        print(f"警告: 未找到 LightNIMA 模型权重 {lite_nima_path}")
-        return
-    
-    # 预处理（与训练保持一致）
-    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
-    IMAGE_NET_STD = [0.229, 0.224, 0.225]
-    normalize = transforms.Normalize(
-            mean=IMAGE_NET_MEAN,
-            std=IMAGE_NET_STD)
-    transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            normalize])
-    
-    # 加载图像
-    image_path = os.path.join(opt.path_to_test_images, opt.image_name)
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"图像未找到: {image_path}")
-    
-    try:
-        image = default_loader(image_path)
-        # 显示原始图像
-        plt.figure(figsize=(10, 6))
-        plt.imshow(image)
-        plt.axis('off')
-        plt.title(f"测试图像: {opt.image_name}")
-        
-        # 保存或显示图像
-        save_dir = os.path.join(os.path.dirname(__file__), "results")
-        os.makedirs(save_dir, exist_ok=True)
-        plt.savefig(os.path.join(save_dir, f'test_image_{os.path.splitext(opt.image_name)[0]}.png'))
-        plt.close()
-        
-        # 转换为张量
-        x = transform(image).unsqueeze(0).to(opt.device)
-    except Exception as e:
-        print(f"处理图像时出错: {str(e)}")
-        return
-
-    # 预热运行 - 消除首次推理的额外开销
-    with torch.no_grad():
-        for _ in range(3):  # 预热3次
-            _ = teacher(x)
-            _ = lite_nima(x)
-    
-    # 教师模型推理时间测量
-    teacher_times = []
-    with torch.no_grad():
-        for _ in range(10):  # 运行10次取平均值
-            torch.cuda.synchronize()  # 确保GPU操作完成
-            start_time = torch.cuda.Event(enable_timing=True)
-            end_time = torch.cuda.Event(enable_timing=True)
-            
-            start_time.record()
-            teacher_pred = teacher(x)
-            end_time.record()
-            
-            torch.cuda.synchronize()
-            teacher_times.append(start_time.elapsed_time(end_time))
-    
-    # LightNIMA模型推理时间测量
-    lite_nima_times = []
-    with torch.no_grad():
-        for _ in range(10):  # 运行10次取平均值
-            torch.cuda.synchronize()
-            start_time = torch.cuda.Event(enable_timing=True)
-            end_time = torch.cuda.Event(enable_timing=True)
-            
-            start_time.record()
-            lite_nima_pred = lite_nima(x)
-            end_time.record()
-            
-            torch.cuda.synchronize()
-            lite_nima_times.append(start_time.elapsed_time(end_time))
-    
-    # 计算平均时间
-    avg_teacher_time = sum(teacher_times) / len(teacher_times)
-    avg_lite_nima_time = sum(lite_nima_times) / len(lite_nima_times)
-    speedup = avg_teacher_time / avg_lite_nima_time
-    
-    # 转换为质量分数（2-11分）
-    _, teacher_score = get_score(opt, teacher_pred)
-    _, lite_nima_score = get_score(opt, lite_nima_pred)
-    score_diff = abs(teacher_score[0] - lite_nima_score[0])
-    
-    # 获取分布结果
-    teacher_dist = F.softmax(teacher_pred, dim=1).cpu().numpy()[0]
-    lite_nima_dist = F.softmax(lite_nima_pred, dim=1).cpu().numpy()[0]
-    
-    # 创建美学评分分布可视化
-    plt.figure(figsize=(12, 6))
-    
-    # 分数分布比较
-    x_labels = list(range(2, 12))
-    width = 0.35
-    plt.bar(np.array(x_labels) - width/2, teacher_dist, width, label='NIMA (教师)')
-    plt.bar(np.array(x_labels) + width/2, lite_nima_dist, width, label='LightNIMA')
-    
-    plt.xlabel('美学评分')
-    plt.ylabel('概率')
-    plt.title(f'美学评分分布 - {os.path.basename(image_path)}')
-    plt.xticks(x_labels)
-    plt.legend()
-    plt.grid(alpha=0.3)
-    
-    # 保存分布图
-    plt.savefig(os.path.join(save_dir, f'score_dist_{os.path.splitext(opt.image_name)[0]}.png'))
-    plt.close()
-
-    # 打印结果
-    print("\n" + "="*50)
-    print(f"图像美学评分: {opt.image_name}")
-    print("="*50)
-    print(f"[NIMA教师] 预测评分: {teacher_score[0]:.2f}, 平均推理时间: {avg_teacher_time:.2f} ms")
-    print(f"[LightNIMA] 预测评分: {lite_nima_score[0]:.2f}, 平均推理时间: {avg_lite_nima_time:.2f} ms")
-    print(f"评分差异: {score_diff:.4f}")
-    print(f"速度提升: {speedup:.2f}x 更快")
-    
-    # 如果是CPU模式，还可以计算内存使用情况
-    if opt.device.type == "cpu":
-        import psutil
-        
-        def get_model_size_mb(model):
-            param_size = 0
-            for param in model.parameters():
-                param_size += param.nelement() * param.element_size()
-            buffer_size = 0
-            for buffer in model.buffers():
-                buffer_size += buffer.nelement() * buffer.element_size()
-            size_mb = (param_size + buffer_size) / 1024 / 1024
-            return size_mb
-        
-        teacher_size = get_model_size_mb(teacher)
-        lite_nima_size = get_model_size_mb(lite_nima)
-        
-        process = psutil.Process(os.getpid())
-        
-        # 强制进行垃圾回收
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        # 测量教师模型推理时的内存使用
-        before_teacher = process.memory_info().rss / (1024 * 1024)
-        _ = teacher(x)
-        after_teacher = process.memory_info().rss / (1024 * 1024)
-        teacher_memory = after_teacher - before_teacher
-        
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        # 测量LightNIMA模型推理时的内存使用
-        before_lite_nima = process.memory_info().rss / (1024 * 1024)
-        _ = lite_nima(x)
-        after_lite_nima = process.memory_info().rss / (1024 * 1024)
-        lite_nima_memory = after_lite_nima - before_lite_nima
-        
-        print(f"模型大小 - NIMA: {teacher_size:.2f} MB, LightNIMA: {lite_nima_size:.2f} MB")
-        print(f"内存使用 - NIMA: {teacher_memory:.2f} MB, LightNIMA: {lite_nima_memory:.2f} MB")
-        print(f"大小减少: {(1 - lite_nima_size/teacher_size)*100:.1f}%")
-    
-    print(f"\n分数分布图已保存至: {os.path.join(save_dir, f'score_dist_{os.path.splitext(opt.image_name)[0]}.png')}")
-    print(f"测试图像已保存至: {os.path.join(save_dir, f'test_image_{os.path.splitext(opt.image_name)[0]}.png')}")
-
-
-    
 def validate_models_on_baid(opt, teacher_model_path, student_model_path, baid_data_path, batch_size=32):
     """
     在BAID数据集上验证和比较教师模型与学生模型的性能。
@@ -2498,6 +2228,1100 @@ def validate_models_on_baid(opt, teacher_model_path, student_model_path, baid_da
     
     return metrics
 
+
+# 修改后的预测函数
+def pred_single():
+    opt = option.init()
+    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
+    
+    # 初始化模型
+    teacher = init_teacher_model(opt)
+    student = init_student_model(opt)
+    student.load_state_dict(torch.load(opt.path_to_student_model_weight, map_location=opt.device))
+    
+    # 预处理（与训练保持一致）
+    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
+    IMAGE_NET_STD = [0.229, 0.224, 0.225]
+    normalize = transforms.Normalize(
+            mean=IMAGE_NET_MEAN,
+            std=IMAGE_NET_STD)
+    transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            normalize])
+    
+    # 加载图像
+    image_path = os.path.join(opt.path_to_test_images, opt.image_name)
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    
+    try:
+        image = default_loader(image_path)
+        x = transform(image).unsqueeze(0).to(opt.device)
+    except Exception as e:
+        print(f"Error processing image: {str(e)}")
+        return
+
+    # 预测并计算质量分数
+    with torch.no_grad():
+        teacher_pred = teacher(x)
+        _,_, _,student_pred = student(x)
+    
+    # 转换为质量分数（1-10分）
+    def calculate_mean_score(pred):
+        scores = torch.nn.functional.softmax(pred, dim=1)
+        return (scores * torch.arange(2, 12, device=pred.device)).sum(dim=1)
+    
+    _, teacher_score = get_score(opt, teacher_pred)
+    _, student_score = get_score(opt, student_pred)
+
+    print(f"[Teacher] Predicted score: {teacher_score[0]:.2f}")
+    print(f"[Student] Predicted score: {student_score[0]:.2f}")
+
+
+def pred_single_with_time():
+    import os  # 确保在函数内部可以访问os模块
+    opt = option.init()
+    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
+    
+    # 初始化模型
+    teacher = init_teacher_model(opt)
+    student = init_student_model(opt)
+    # student.load_state_dict(torch.load(opt.path_to_student_model_weight, map_location=opt.device))
+    
+    # 预处理（与训练保持一致）
+    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
+    IMAGE_NET_STD = [0.229, 0.224, 0.225]
+    normalize = transforms.Normalize(
+            mean=IMAGE_NET_MEAN,
+            std=IMAGE_NET_STD)
+    transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            normalize])
+    
+    # 加载图像
+    image_path = os.path.join(opt.path_to_test_images, opt.image_name)
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    
+    try:
+        image = default_loader(image_path)
+        x = transform(image).unsqueeze(0).to(opt.device)
+    except Exception as e:
+        print(f"Error processing image: {str(e)}")
+        return
+
+    # 预热运行 - 消除首次推理的额外开销
+    with torch.no_grad():
+        for _ in range(3):  # 预热3次
+            _ = teacher(x)
+            _, _, _, _ = student(x)
+    
+    # 教师模型推理时间测量
+    teacher_times = []
+    with torch.no_grad():
+        for _ in range(10):  # 运行10次取平均值
+            torch.cuda.synchronize()  # 确保GPU操作完成
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            
+            start_time.record()
+            teacher_pred = teacher(x)
+            end_time.record()
+            
+            torch.cuda.synchronize()
+            teacher_times.append(start_time.elapsed_time(end_time))
+    
+    # 学生模型推理时间测量
+    student_times = []
+    with torch.no_grad():
+        for _ in range(10):  # 运行10次取平均值
+            torch.cuda.synchronize()
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            
+            start_time.record()
+            _, _, _, student_pred = student(x)
+            end_time.record()
+            
+            torch.cuda.synchronize()
+            student_times.append(start_time.elapsed_time(end_time))
+    
+    # 计算平均时间
+    avg_teacher_time = sum(teacher_times) / len(teacher_times)
+    avg_student_time = sum(student_times) / len(student_times)
+    speedup = avg_teacher_time / avg_student_time
+    
+    # 转换为质量分数（1-10分）
+    _, teacher_score = get_score(opt, teacher_pred)
+    _, student_score = get_score(opt, student_pred)
+    score_diff = abs(teacher_score[0] - student_score[0])
+
+    print(f"[Teacher] Predicted score: {teacher_score[0]:.2f}, Avg. Inference Time: {avg_teacher_time:.2f} ms")
+    print(f"[Student] Predicted score: {student_score[0]:.2f}, Avg. Inference Time: {avg_student_time:.2f} ms")
+    print(f"Score difference: {score_diff:.4f}")
+    print(f"Speedup ratio: {speedup:.2f}x faster")
+    
+    # 如果是CPU模式，还可以计算内存使用情况
+    if opt.device.type == "cpu":
+        import psutil
+        
+        def get_model_size_mb(model):
+            param_size = 0
+            for param in model.parameters():
+                param_size += param.nelement() * param.element_size()
+            buffer_size = 0
+            for buffer in model.buffers():
+                buffer_size += buffer.nelement() * buffer.element_size()
+            size_mb = (param_size + buffer_size) / 1024 / 1024
+            return size_mb
+        
+        teacher_size = get_model_size_mb(teacher)
+        student_size = get_model_size_mb(student)
+        
+        process = psutil.Process(os.getpid())  # 注意这里的os必须在函数顶部导入
+        
+        # 强制进行垃圾回收
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # 测量教师模型推理时的内存使用
+        before_teacher = process.memory_info().rss / (1024 * 1024)
+        _ = teacher(x)
+        after_teacher = process.memory_info().rss / (1024 * 1024)
+        teacher_memory = after_teacher - before_teacher
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # 测量学生模型推理时的内存使用
+        before_student = process.memory_info().rss / (1024 * 1024)
+        _, _, _, _ = student(x)
+        after_student = process.memory_info().rss / (1024 * 1024)
+        student_memory = after_student - before_student
+        
+        print(f"Model Size - Teacher: {teacher_size:.2f} MB, Student: {student_size:.2f} MB")
+        print(f"Memory Usage - Teacher: {teacher_memory:.2f} MB, Student: {student_memory:.2f} MB")
+        print(f"Size reduction: {(1 - student_size/teacher_size)*100:.1f}%")
+
+
+def pred_single_with_time_lite_nima():
+    """
+    使用 LightNIMA 模型对单张图像进行预测，并测量推理时间与原始 NIMA 模型进行比较
+    """
+    import os
+    opt = option.init()
+    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
+    
+    # 初始化模型
+    teacher = init_teacher_model(opt)
+    lite_nima = LightNIMA().to(opt.device)
+    
+    # 加载 LightNIMA 模型权重
+    lite_nima_path = os.path.join(os.path.dirname(__file__), "trained_models", "lite_nima", "lite_nima_best.pth")
+    if os.path.exists(lite_nima_path):
+        lite_nima.load_state_dict(torch.load(lite_nima_path, map_location=opt.device,weights_only=False))
+        print(f"成功加载 LightNIMA 模型权重: {lite_nima_path}")
+    else:
+        print(f"警告: 未找到 LightNIMA 模型权重 {lite_nima_path}")
+        return
+    
+    # 预处理（与训练保持一致）
+    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
+    IMAGE_NET_STD = [0.229, 0.224, 0.225]
+    normalize = transforms.Normalize(
+            mean=IMAGE_NET_MEAN,
+            std=IMAGE_NET_STD)
+    transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            normalize])
+    
+    # 加载图像
+    image_path = os.path.join(opt.path_to_test_images, opt.image_name)
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"图像未找到: {image_path}")
+    
+    try:
+        image = default_loader(image_path)
+        # 显示原始图像
+        plt.figure(figsize=(10, 6))
+        plt.imshow(image)
+        plt.axis('off')
+        plt.title(f"测试图像: {opt.image_name}")
+        
+        # 保存或显示图像
+        save_dir = os.path.join(os.path.dirname(__file__), "results")
+        os.makedirs(save_dir, exist_ok=True)
+        plt.savefig(os.path.join(save_dir, f'test_image_{os.path.splitext(opt.image_name)[0]}.png'))
+        plt.close()
+        
+        # 转换为张量
+        x = transform(image).unsqueeze(0).to(opt.device)
+    except Exception as e:
+        print(f"处理图像时出错: {str(e)}")
+        return
+
+    # 预热运行 - 消除首次推理的额外开销
+    with torch.no_grad():
+        for _ in range(3):  # 预热3次
+            _ = teacher(x)
+            _ = lite_nima(x)
+    
+    # 教师模型推理时间测量
+    teacher_times = []
+    with torch.no_grad():
+        for _ in range(10):  # 运行10次取平均值
+            torch.cuda.synchronize()  # 确保GPU操作完成
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            
+            start_time.record()
+            teacher_pred = teacher(x)
+            end_time.record()
+            
+            torch.cuda.synchronize()
+            teacher_times.append(start_time.elapsed_time(end_time))
+    
+    # LightNIMA模型推理时间测量
+    lite_nima_times = []
+    with torch.no_grad():
+        for _ in range(10):  # 运行10次取平均值
+            torch.cuda.synchronize()
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            
+            start_time.record()
+            lite_nima_pred = lite_nima(x)
+            end_time.record()
+            
+            torch.cuda.synchronize()
+            lite_nima_times.append(start_time.elapsed_time(end_time))
+    
+    # 计算平均时间
+    avg_teacher_time = sum(teacher_times) / len(teacher_times)
+    avg_lite_nima_time = sum(lite_nima_times) / len(lite_nima_times)
+    speedup = avg_teacher_time / avg_lite_nima_time
+    
+    # 转换为质量分数（2-11分）
+    _, teacher_score = get_score(opt, teacher_pred)
+    _, lite_nima_score = get_score(opt, lite_nima_pred)
+    score_diff = abs(teacher_score[0] - lite_nima_score[0])
+    
+    # 获取分布结果
+    teacher_dist = F.softmax(teacher_pred, dim=1).cpu().numpy()[0]
+    lite_nima_dist = F.softmax(lite_nima_pred, dim=1).cpu().numpy()[0]
+    
+    # 创建美学评分分布可视化
+    plt.figure(figsize=(12, 6))
+    
+    # 分数分布比较
+    x_labels = list(range(2, 12))
+    width = 0.35
+    plt.bar(np.array(x_labels) - width/2, teacher_dist, width, label='NIMA (教师)')
+    plt.bar(np.array(x_labels) + width/2, lite_nima_dist, width, label='LightNIMA')
+    
+    plt.xlabel('美学评分')
+    plt.ylabel('概率')
+    plt.title(f'美学评分分布 - {os.path.basename(image_path)}')
+    plt.xticks(x_labels)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    
+    # 保存分布图
+    plt.savefig(os.path.join(save_dir, f'score_dist_{os.path.splitext(opt.image_name)[0]}.png'))
+    plt.close()
+
+    # 打印结果
+    print("\n" + "="*50)
+    print(f"图像美学评分: {opt.image_name}")
+    print("="*50)
+    print(f"[NIMA教师] 预测评分: {teacher_score[0]:.2f}, 平均推理时间: {avg_teacher_time:.2f} ms")
+    print(f"[LightNIMA] 预测评分: {lite_nima_score[0]:.2f}, 平均推理时间: {avg_lite_nima_time:.2f} ms")
+    print(f"评分差异: {score_diff:.4f}")
+    print(f"速度提升: {speedup:.2f}x 更快")
+    
+    # 如果是CPU模式，还可以计算内存使用情况
+    if opt.device.type == "cpu":
+        import psutil
+        
+        def get_model_size_mb(model):
+            param_size = 0
+            for param in model.parameters():
+                param_size += param.nelement() * param.element_size()
+            buffer_size = 0
+            for buffer in model.buffers():
+                buffer_size += buffer.nelement() * buffer.element_size()
+            size_mb = (param_size + buffer_size) / 1024 / 1024
+            return size_mb
+        
+        teacher_size = get_model_size_mb(teacher)
+        lite_nima_size = get_model_size_mb(lite_nima)
+        
+        process = psutil.Process(os.getpid())
+        
+        # 强制进行垃圾回收
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # 测量教师模型推理时的内存使用
+        before_teacher = process.memory_info().rss / (1024 * 1024)
+        _ = teacher(x)
+        after_teacher = process.memory_info().rss / (1024 * 1024)
+        teacher_memory = after_teacher - before_teacher
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # 测量LightNIMA模型推理时的内存使用
+        before_lite_nima = process.memory_info().rss / (1024 * 1024)
+        _ = lite_nima(x)
+        after_lite_nima = process.memory_info().rss / (1024 * 1024)
+        lite_nima_memory = after_lite_nima - before_lite_nima
+        
+        print(f"模型大小 - NIMA: {teacher_size:.2f} MB, LightNIMA: {lite_nima_size:.2f} MB")
+        print(f"内存使用 - NIMA: {teacher_memory:.2f} MB, LightNIMA: {lite_nima_memory:.2f} MB")
+        print(f"大小减少: {(1 - lite_nima_size/teacher_size)*100:.1f}%")
+    
+    print(f"\n分数分布图已保存至: {os.path.join(save_dir, f'score_dist_{os.path.splitext(opt.image_name)[0]}.png')}")
+    print(f"测试图像已保存至: {os.path.join(save_dir, f'test_image_{os.path.splitext(opt.image_name)[0]}.png')}")
+
+    query_image_label(opt)  # 查询图像标签
+
+
+def batch_predict_drone_images():
+    """
+    批量预测ImagesForDrone文件夹中的所有图像，并比较教师模型和LightNIMA模型的结果
+    """
+    opt = option.init()
+    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
+    
+    # 指定图像文件夹
+    image_folder = r"C:\Users\Administrator\Documents\GitHub\ReLIC\Images\ImagesForDrone"
+    
+    # 确保文件夹存在
+    if not os.path.exists(image_folder):
+        print(f"错误: 文件夹 {image_folder} 不存在")
+        return
+    
+    # 获取所有图像文件
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
+    image_files = []
+    for file in os.listdir(image_folder):
+        ext = os.path.splitext(file)[1].lower()
+        if ext in image_extensions:
+            image_files.append(os.path.join(image_folder, file))
+    
+    if len(image_files) == 0:
+        print(f"错误: 文件夹 {image_folder} 中没有找到图像文件")
+        return
+    
+    print(f"找到 {len(image_files)} 个图像文件")
+    
+    # 初始化模型
+    teacher = init_teacher_model(opt)
+    lite_nima = LightNIMA().to(opt.device)
+    
+    # 加载LightNIMA模型权重
+    lite_nima_path = os.path.join(os.path.dirname(__file__), "trained_models", "lite_nima", "lite_nima_best.pth")
+    if os.path.exists(lite_nima_path):
+        lite_nima.load_state_dict(torch.load(lite_nima_path, map_location=opt.device, weights_only=True))
+        print(f"成功加载 LightNIMA 模型权重: {lite_nima_path}")
+    else:
+        print(f"警告: 未找到 LightNIMA 模型权重 {lite_nima_path}")
+        return
+    
+    # 预处理（与训练保持一致）
+    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
+    IMAGE_NET_STD = [0.229, 0.224, 0.225]
+    normalize = transforms.Normalize(
+            mean=IMAGE_NET_MEAN,
+            std=IMAGE_NET_STD)
+    transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            normalize])
+    
+    # 设置评估模式
+    teacher.eval()
+    lite_nima.eval()
+    
+    # 准备存储结果的列表
+    results = []
+    
+    # 创建结果目录
+    results_dir = os.path.join(os.path.dirname(__file__), "results", "drone_images")
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # 创建可视化目录
+    vis_dir = os.path.join(results_dir, "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    # 批量预测
+    print("开始批量预测...")
+    
+    # 记录总的推理时间
+    total_teacher_time = 0
+    total_lite_nima_time = 0
+    
+    for img_path in tqdm(image_files, desc="预测进度"):
+        img_name = os.path.basename(img_path)
+        
+        try:
+            # 加载和预处理图像
+            image = default_loader(img_path)
+            x = transform(image).unsqueeze(0).to(opt.device)
+            
+            # 教师模型推理（测量时间）
+            torch.cuda.synchronize()
+            t_start = time.time()
+            with torch.no_grad():
+                teacher_pred = teacher(x)
+            torch.cuda.synchronize()
+            t_end = time.time()
+            teacher_time = (t_end - t_start) * 1000  # 转换为毫秒
+            total_teacher_time += teacher_time
+            
+            # LightNIMA模型推理（测量时间）
+            torch.cuda.synchronize()
+            s_start = time.time()
+            with torch.no_grad():
+                lite_nima_pred = lite_nima(x)
+            torch.cuda.synchronize()
+            s_end = time.time()
+            lite_nima_time = (s_end - s_start) * 1000  # 转换为毫秒
+            total_lite_nima_time += lite_nima_time
+            
+            # 转换为质量分数（2-11分）
+            _, teacher_score = get_score(opt, teacher_pred)
+            _, lite_nima_score = get_score(opt, lite_nima_pred)
+            
+            # 获取分布结果
+            teacher_dist = F.softmax(teacher_pred, dim=1).cpu().numpy()[0]
+            lite_nima_dist = F.softmax(lite_nima_pred, dim=1).cpu().numpy()[0]
+            
+            # 将结果添加到列表
+            results.append({
+                'image_name': img_name,
+                'teacher_score': float(teacher_score[0]),
+                'lite_nima_score': float(lite_nima_score[0]),
+                'score_diff': abs(float(teacher_score[0] - lite_nima_score[0])),
+                'teacher_time': teacher_time,
+                'lite_nima_time': lite_nima_time,
+                'speedup': teacher_time / lite_nima_time
+            })
+            
+            # 创建美学评分分布可视化
+            plt.figure(figsize=(12, 6))
+            
+            # 分数分布比较
+            x_labels = list(range(2, 12))
+            width = 0.35
+            plt.bar(np.array(x_labels) - width/2, teacher_dist, width, label='NIMA (教师)')
+            plt.bar(np.array(x_labels) + width/2, lite_nima_dist, width, label='LightNIMA')
+            
+            plt.xlabel('美学评分')
+            plt.ylabel('概率')
+            plt.title(f'美学评分分布 - {img_name}')
+            plt.xticks(x_labels)
+            plt.legend()
+            plt.grid(alpha=0.3)
+            
+            # 保存分布图
+            plt.savefig(os.path.join(vis_dir, f'dist_{os.path.splitext(img_name)[0]}.png'))
+            plt.close()
+            
+        except Exception as e:
+            print(f"处理图像 {img_name} 时出错: {str(e)}")
+            continue
+    
+    # 计算平均推理时间
+    avg_teacher_time = total_teacher_time / len(image_files)
+    avg_lite_nima_time = total_lite_nima_time / len(image_files)
+    avg_speedup = avg_teacher_time / avg_lite_nima_time
+    
+    # 计算平均分数差异
+    score_diffs = [r['score_diff'] for r in results]
+    avg_score_diff = sum(score_diffs) / len(score_diffs)
+    
+    # 计算相关系数
+    teacher_scores = [r['teacher_score'] for r in results]
+    lite_nima_scores = [r['lite_nima_score'] for r in results]
+    pearson_corr = pearsonr(teacher_scores, lite_nima_scores)[0]
+    spearman_corr = spearmanr(teacher_scores, lite_nima_scores)[0]
+    
+    # 按教师模型评分对结果排序
+    results.sort(key=lambda x: x['teacher_score'], reverse=True)
+    
+    # 创建CSV文件保存详细结果
+    import csv
+    csv_path = os.path.join(results_dir, "prediction_results.csv")
+    with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['image_name', 'teacher_score', 'lite_nima_score', 'score_diff', 
+                     'teacher_time', 'lite_nima_time', 'speedup']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r)
+    
+    # 创建可视化散点图比较
+    plt.figure(figsize=(10, 8))
+    plt.scatter(teacher_scores, lite_nima_scores, alpha=0.7)
+    plt.plot([2, 11], [2, 11], 'r--')
+    plt.xlabel('Teacher Score')
+    plt.ylabel('Light Model Score')
+    plt.title(f'NIMA vs LightNIMA (Pearson={pearson_corr:.4f}, Spearman={spearman_corr:.4f})')
+    plt.grid(alpha=0.3)
+    plt.savefig(os.path.join(results_dir, 'score_correlation.png'), dpi=300)
+    plt.close()
+    
+    # 创建模型计算时间比较柱状图
+    plt.figure(figsize=(8, 6))
+    plt.bar(['Teacher Model', 'Light Model'], [avg_teacher_time, avg_lite_nima_time])
+    plt.ylabel('Everage Prediction Time(ms)')
+    plt.title(f'Prediction Time Comparison (Acc RAtio: {avg_speedup:.2f}x)')
+    plt.grid(axis='y', alpha=0.3)
+    plt.savefig(os.path.join(results_dir, 'time_comparison.png'), dpi=300)
+    plt.close()
+    
+    # 打印总结信息
+    print("\n" + "="*50)
+    print("无人机图像美学评分预测结果")
+    print("="*50)
+    print(f"处理图像总数: {len(results)}")
+    print(f"\n推理性能比较:")
+    print(f"平均推理时间 - 教师: {avg_teacher_time:.2f}ms, LightNIMA: {avg_lite_nima_time:.2f}ms")
+    print(f"加速比: {avg_speedup:.2f}x")
+    
+    print(f"\n预测一致性:")
+    print(f"平均分数差异: {avg_score_diff:.4f}")
+    print(f"Pearson相关系数: {pearson_corr:.4f}")
+    print(f"Spearman相关系数: {spearman_corr:.4f}")
+    
+    print(f"\n评分最高的5张图像:")
+    for i in range(min(5, len(results))):
+        r = results[i]
+        print(f"{i+1}. {r['image_name']}: 教师={r['teacher_score']:.2f}, LightNIMA={r['lite_nima_score']:.2f}")
+    
+    print(f"\n详细结果已保存至: {csv_path}")
+    print(f"可视化结果已保存至: {vis_dir}")
+    print(f"模型比较图表已保存至: {results_dir}")
+    
+    # 返回结果字典，方便后续使用
+    return {
+        'results': results,
+        'avg_teacher_time': avg_teacher_time,
+        'avg_lite_nima_time': avg_lite_nima_time,
+        'avg_speedup': avg_speedup,
+        'pearson_corr': pearson_corr,
+        'spearman_corr': spearman_corr,
+        'avg_score_diff': avg_score_diff
+    }
+  
+
+def batch_predict_drone_images_for_paper():
+    """
+    Batch predicting aesthetics scores for drone images.
+    This enhanced version is designed for research paper comparisons,
+    with comprehensive metrics, standardized visualizations, and detailed reports.
+    
+    Compares NIMA teacher model with LightNIMA and calculates various metrics.
+    """
+    opt = option.init()
+    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
+    
+    # Image folder specification
+    image_folder = r"C:\Users\Administrator\Documents\GitHub\ReLIC\Images\ImagesForDrone"
+    
+    # Ensure directory exists
+    if not os.path.exists(image_folder):
+        print(f"Error: Directory {image_folder} does not exist")
+        return
+    
+    # Get all image files
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
+    image_files = []
+    for file in os.listdir(image_folder):
+        ext = os.path.splitext(file)[1].lower()
+        if ext in image_extensions:
+            image_files.append(os.path.join(image_folder, file))
+    
+    if len(image_files) == 0:
+        print(f"Error: No image files found in {image_folder}")
+        return
+    
+    print(f"Found {len(image_files)} image files")
+    
+    # Initialize models
+    teacher = init_teacher_model(opt)
+    lite_nima = LightNIMA().to(opt.device)
+    
+    # Load LightNIMA model weights
+    lite_nima_path = os.path.join(os.path.dirname(__file__), "trained_models", "lite_nima", "lite_nima_best.pth")
+    if os.path.exists(lite_nima_path):
+        lite_nima.load_state_dict(torch.load(lite_nima_path, map_location=opt.device, weights_only=True))
+        print(f"Successfully loaded LightNIMA model weights: {lite_nima_path}")
+    else:
+        print(f"Warning: LightNIMA model weights not found at {lite_nima_path}")
+        return
+    
+    # Preprocessing (consistent with training)
+    IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
+    IMAGE_NET_STD = [0.229, 0.224, 0.225]
+    normalize = transforms.Normalize(mean=IMAGE_NET_MEAN, std=IMAGE_NET_STD)
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        normalize
+    ])
+    
+    # Set evaluation mode
+    teacher.eval()
+    lite_nima.eval()
+    
+    # Calculate model sizes
+    def get_model_size(model):
+        param_size = 0
+        for param in model.parameters():
+            param_size += param.nelement() * param.element_size()
+        buffer_size = 0
+        for buffer in model.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+        return param_size + buffer_size
+    
+    teacher_size = get_model_size(teacher) / (1024 * 1024)  # MB
+    lite_nima_size = get_model_size(lite_nima) / (1024 * 1024)  # MB
+    size_reduction = (teacher_size - lite_nima_size) / teacher_size * 100
+    
+    print(f"Model Size - NIMA: {teacher_size:.2f} MB, LightNIMA: {lite_nima_size:.2f} MB")
+    print(f"Size Reduction: {size_reduction:.2f}%")
+    
+    # Prepare results storage
+    results = []
+    
+    # Create results directory with timestamp
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    results_dir = os.path.join(os.path.dirname(__file__), "results", f"paper_comparison_{timestamp}")
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # Create visualization directories
+    vis_dir = os.path.join(results_dir, "distributions")
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    # Configure matplotlib for publication quality
+    plt.rcParams['font.family'] = 'serif'
+    plt.rcParams['font.serif'] = ['Times New Roman']
+    plt.rcParams['font.size'] = 11
+    plt.rcParams['figure.figsize'] = (8, 6)
+    plt.rcParams['figure.dpi'] = 300
+    
+    # Batch prediction
+    print("Starting batch prediction...")
+    
+    # Record total inference times
+    total_teacher_time = 0
+    total_lite_nima_time = 0
+    
+    # Additional metrics for research
+    score_ranges = {
+        'low': {'range': (2.0, 5.0), 'teacher_scores': [], 'lite_scores': []},
+        'medium': {'range': (5.0, 8.0), 'teacher_scores': [], 'lite_scores': []},
+        'high': {'range': (8.0, 11.0), 'teacher_scores': [], 'lite_scores': []}
+    }
+    
+    # Store all distribution data for later analysis
+    all_teacher_dists = []
+    all_lite_nima_dists = []
+    
+    # Run warmup to ensure GPU is ready
+    dummy_input = torch.randn(1, 3, 224, 224).to(opt.device)
+    with torch.no_grad():
+        for _ in range(3):
+            _ = teacher(dummy_input)
+            _ = lite_nima(dummy_input)
+    
+    # Main processing loop
+    for img_path in tqdm(image_files, desc="Prediction Progress"):
+        img_name = os.path.basename(img_path)
+        
+        try:
+            # Load and preprocess image
+            image = default_loader(img_path)
+            x = transform(image).unsqueeze(0).to(opt.device)
+            
+            # Teacher model inference (measure time)
+            torch.cuda.synchronize()
+            t_start = time.time()
+            with torch.no_grad():
+                teacher_pred = teacher(x)
+            torch.cuda.synchronize()
+            t_end = time.time()
+            teacher_time = (t_end - t_start) * 1000  # convert to ms
+            total_teacher_time += teacher_time
+            
+            # LightNIMA model inference (measure time)
+            torch.cuda.synchronize()
+            s_start = time.time()
+            with torch.no_grad():
+                lite_nima_pred = lite_nima(x)
+            torch.cuda.synchronize()
+            s_end = time.time()
+            lite_nima_time = (s_end - s_start) * 1000  # convert to ms
+            total_lite_nima_time += lite_nima_time
+            
+            # Convert to quality scores (2-11 scale)
+            _, teacher_score = get_score(opt, teacher_pred)
+            _, lite_nima_score = get_score(opt, lite_nima_pred)
+            
+            # Get distribution results
+            teacher_dist = F.softmax(teacher_pred, dim=1).cpu().numpy()[0]
+            lite_nima_dist = F.softmax(lite_nima_pred, dim=1).cpu().numpy()[0]
+            
+            # Store distributions for analysis
+            all_teacher_dists.append(teacher_dist)
+            all_lite_nima_dists.append(lite_nima_dist)
+            
+            # Add to score range analysis
+            t_score = float(teacher_score[0])
+            l_score = float(lite_nima_score[0])
+            
+            for category in score_ranges:
+                low, high = score_ranges[category]['range']
+                if low <= t_score < high:
+                    score_ranges[category]['teacher_scores'].append(t_score)
+                    score_ranges[category]['lite_scores'].append(l_score)
+            
+            # Calculate EMD (Earth Mover's Distance)
+            emd_dist = np.sum(np.abs(np.cumsum(teacher_dist) - np.cumsum(lite_nima_dist)))
+            
+            # Calculate Jensen-Shannon Divergence
+            def js_divergence(p, q):
+                m = 0.5 * (p + q)
+                return 0.5 * np.sum(p * np.log(p / m + 1e-10)) + 0.5 * np.sum(q * np.log(q / m + 1e-10))
+            
+            js_div = js_divergence(teacher_dist, lite_nima_dist)
+            
+            # Add results to list
+            results.append({
+                'image_name': img_name,
+                'teacher_score': t_score,
+                'lite_nima_score': l_score,
+                'abs_diff': abs(t_score - l_score),
+                'rel_diff_pct': 100 * abs(t_score - l_score) / t_score,
+                'teacher_time': teacher_time,
+                'lite_nima_time': lite_nima_time,
+                'speedup': teacher_time / lite_nima_time,
+                'emd': emd_dist,
+                'js_divergence': js_div
+            })
+            
+            # Create aesthetics score distribution visualization
+            plt.figure(figsize=(8, 5))
+            
+            # Score distribution comparison
+            x_labels = list(range(2, 12))
+            width = 0.35
+            plt.bar(np.array(x_labels) - width/2, teacher_dist, width, label='NIMA (Teacher)', color='#1f77b4', alpha=0.8)
+            plt.bar(np.array(x_labels) + width/2, lite_nima_dist, width, label='LightNIMA', color='#ff7f0e', alpha=0.8)
+            
+            plt.xlabel('Aesthetic Score')
+            plt.ylabel('Probability')
+            plt.title(f'Score Distribution - {img_name}')
+            plt.xticks(x_labels)
+            plt.legend()
+            plt.grid(alpha=0.3)
+            
+            # Save distribution plot
+            plt.savefig(os.path.join(vis_dir, f'dist_{os.path.splitext(img_name)[0]}.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print(f"Error processing image {img_name}: {str(e)}")
+            continue
+    
+    # Calculate average inference times
+    avg_teacher_time = total_teacher_time / len(results)
+    avg_lite_nima_time = total_lite_nima_time / len(results)
+    avg_speedup = avg_teacher_time / avg_lite_nima_time
+    
+    # Calculate various statistics
+    teacher_scores = np.array([r['teacher_score'] for r in results])
+    lite_nima_scores = np.array([r['lite_nima_score'] for r in results])
+    abs_diffs = np.array([r['abs_diff'] for r in results])
+    rel_diffs = np.array([r['rel_diff_pct'] for r in results])
+    
+    # Calculate average distributions
+    avg_teacher_dist = np.mean(all_teacher_dists, axis=0)
+    avg_lite_nima_dist = np.mean(all_lite_nima_dists, axis=0)
+    
+    # Calculate correlation coefficients
+    pearson_corr, p_value_pearson = pearsonr(teacher_scores, lite_nima_scores)
+    spearman_corr, p_value_spearman = spearmanr(teacher_scores, lite_nima_scores)
+    
+    # Calculate additional metrics
+    mae = np.mean(abs_diffs)
+    rmse = np.sqrt(np.mean(np.square(teacher_scores - lite_nima_scores)))
+    mape = np.mean(rel_diffs)
+    
+    # Generate summary statistics for CSV
+    summary_stats = {
+        'metric': [
+            'Model Size (MB)', 
+            'Size Reduction (%)', 
+            'Average Inference Time (ms)',
+            'Speed Improvement (%)',
+            'Pearson Correlation',
+            'Spearman Correlation',
+            'Mean Absolute Error',
+            'Root Mean Square Error',
+            'Mean Absolute Percentage Error (%)',
+        ],
+        'nima': [
+            f"{teacher_size:.2f}",
+            "-",
+            f"{avg_teacher_time:.2f}",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-"
+        ],
+        'light_nima': [
+            f"{lite_nima_size:.2f}",
+            f"{size_reduction:.2f}",
+            f"{avg_lite_nima_time:.2f}",
+            f"{100*(1-1/avg_speedup):.2f}",
+            f"{pearson_corr:.4f} (p={p_value_pearson:.4f})",
+            f"{spearman_corr:.4f} (p={p_value_spearman:.4f})",
+            f"{mae:.4f}",
+            f"{rmse:.4f}",
+            f"{mape:.2f}"
+        ]
+    }
+    
+    # Calculate statistics for different score ranges
+    for category in score_ranges:
+        if len(score_ranges[category]['teacher_scores']) > 0:
+            t_scores = np.array(score_ranges[category]['teacher_scores'])
+            l_scores = np.array(score_ranges[category]['lite_scores'])
+            
+            if len(t_scores) >= 2:  # Need at least 2 points for correlation
+                cat_pearson, _ = pearsonr(t_scores, l_scores)
+                cat_mae = np.mean(np.abs(t_scores - l_scores))
+                
+                summary_stats['metric'].append(f"{category.capitalize()} Range Correlation")
+                summary_stats['nima'].append("-")
+                summary_stats['light_nima'].append(f"{cat_pearson:.4f} (n={len(t_scores)})")
+                
+                summary_stats['metric'].append(f"{category.capitalize()} Range MAE")
+                summary_stats['nima'].append("-")
+                summary_stats['light_nima'].append(f"{cat_mae:.4f}")
+    
+    # Create dataframes for easy CSV export
+    import pandas as pd
+    df_results = pd.DataFrame(results)
+    df_summary = pd.DataFrame(summary_stats)
+    
+    # Save detailed results to CSV
+    csv_details_path = os.path.join(results_dir, "detailed_results.csv")
+    df_results.to_csv(csv_details_path, index=False)
+    
+    # Save summary statistics to CSV
+    csv_summary_path = os.path.join(results_dir, "summary_statistics.csv")
+    df_summary.to_csv(csv_summary_path, index=False)
+    
+    # Create correlation scatter plot
+    plt.figure(figsize=(8, 6))
+    plt.scatter(teacher_scores, lite_nima_scores, alpha=0.7, s=40)
+    plt.plot([2, 11], [2, 11], 'r--', alpha=0.7)
+    
+    # Add regression line
+    z = np.polyfit(teacher_scores, lite_nima_scores, 1)
+    p = np.poly1d(z)
+    plt.plot(sorted(teacher_scores), p(sorted(teacher_scores)), "b-", alpha=0.5)
+    
+    plt.xlabel('NIMA Teacher Score')
+    plt.ylabel('LightNIMA Score')
+    plt.title(f'Model Correlation\nPearson r={pearson_corr:.4f}, Spearman ρ={spearman_corr:.4f}')
+    plt.grid(alpha=0.3)
+    plt.xlim(2, 11)
+    plt.ylim(2, 11)
+    
+    # Add text info
+    info_text = f"n = {len(results)}\nMAE = {mae:.4f}\nRMSE = {rmse:.4f}"
+    plt.annotate(info_text, xy=(0.05, 0.95), xycoords='axes fraction', 
+                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
+                 ha='left', va='top')
+    
+    plt.savefig(os.path.join(results_dir, 'score_correlation.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Create error distribution histogram
+    plt.figure(figsize=(8, 5))
+    plt.hist(abs_diffs, bins=20, alpha=0.7, color='#2ca02c')
+    plt.axvline(mae, color='red', linestyle='dashed', linewidth=1, label=f'MAE = {mae:.4f}')
+    plt.xlabel('Absolute Score Difference')
+    plt.ylabel('Frequency')
+    plt.title('Error Distribution')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig(os.path.join(results_dir, 'error_distribution.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Create execution time comparison
+    plt.figure(figsize=(10, 6))
+    
+    # Execution time boxplot
+    plt.subplot(1, 2, 1)
+    time_data = [
+        [r['teacher_time'] for r in results],
+        [r['lite_nima_time'] for r in results]
+    ]
+    plt.boxplot(time_data, labels=['NIMA', 'LightNIMA'])
+    plt.ylabel('Inference Time (ms)')
+    plt.title('Inference Time Distribution')
+    plt.grid(axis='y', alpha=0.3)
+    
+    # Average time bar chart
+    plt.subplot(1, 2, 2)
+    plt.bar(['NIMA', 'LightNIMA'], [avg_teacher_time, avg_lite_nima_time], color=['#1f77b4', '#ff7f0e'])
+    plt.ylabel('Average Inference Time (ms)')
+    plt.title(f'Average Time Comparison\n{avg_speedup:.2f}x Speedup')
+    
+    # Add text annotations
+    plt.text(0, avg_teacher_time + 1, f"{avg_teacher_time:.2f} ms", ha='center')
+    plt.text(1, avg_lite_nima_time + 1, f"{avg_lite_nima_time:.2f} ms", ha='center')
+    
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, 'time_comparison.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Create model size comparison
+    plt.figure(figsize=(8, 5))
+    plt.bar(['NIMA', 'LightNIMA'], [teacher_size, lite_nima_size], color=['#1f77b4', '#ff7f0e'])
+    plt.ylabel('Model Size (MB)')
+    plt.title(f'Model Size Comparison\n{size_reduction:.1f}% Reduction')
+    
+    # Add text annotations
+    plt.text(0, teacher_size + 1, f"{teacher_size:.2f} MB", ha='center')
+    plt.text(1, lite_nima_size + 1, f"{lite_nima_size:.2f} MB", ha='center')
+    
+    plt.grid(axis='y', alpha=0.3)
+    plt.savefig(os.path.join(results_dir, 'model_size_comparison.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Create average distribution comparison
+    plt.figure(figsize=(8, 5))
+    x_labels = list(range(2, 12))
+    width = 0.35
+    plt.bar(np.array(x_labels) - width/2, avg_teacher_dist, width, label='NIMA (Average)', color='#1f77b4', alpha=0.8)
+    plt.bar(np.array(x_labels) + width/2, avg_lite_nima_dist, width, label='LightNIMA (Average)', color='#ff7f0e', alpha=0.8)
+    
+    plt.xlabel('Aesthetic Score')
+    plt.ylabel('Average Probability')
+    plt.title('Average Distribution Comparison')
+    plt.xticks(x_labels)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    
+    plt.savefig(os.path.join(results_dir, 'average_distribution.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Print summary information
+    print("\n" + "="*60)
+    print("Drone Image Aesthetics Assessment - Research Results Summary")
+    print("="*60)
+    print(f"Processed images: {len(results)}")
+    print(f"\nModel Comparison:")
+    print(f"- Size: NIMA = {teacher_size:.2f} MB, LightNIMA = {lite_nima_size:.2f} MB ({size_reduction:.1f}% reduction)")
+    print(f"- Speed: NIMA = {avg_teacher_time:.2f} ms, LightNIMA = {avg_lite_nima_time:.2f} ms ({avg_speedup:.2f}x faster)")
+    
+    print(f"\nScore Prediction:")
+    print(f"- Pearson correlation: r = {pearson_corr:.4f} (p = {p_value_pearson:.4g})")
+    print(f"- Spearman correlation: ρ = {spearman_corr:.4f} (p = {p_value_spearman:.4g})")
+    print(f"- Mean Absolute Error: {mae:.4f}")
+    print(f"- Root Mean Square Error: {rmse:.4f}")
+    print(f"- Mean Absolute Percentage Error: {mape:.2f}%")
+    
+    # Score range analysis
+    print("\nScore Range Analysis:")
+    for category in score_ranges:
+        if len(score_ranges[category]['teacher_scores']) > 0:
+            t_scores = np.array(score_ranges[category]['teacher_scores'])
+            l_scores = np.array(score_ranges[category]['lite_scores'])
+            
+            if len(t_scores) >= 2:  # Need at least 2 points for correlation
+                cat_pearson, _ = pearsonr(t_scores, l_scores)
+                cat_mae = np.mean(np.abs(t_scores - l_scores))
+                print(f"- {category.capitalize()} range ({score_ranges[category]['range'][0]}-{score_ranges[category]['range'][1]}): " +
+                      f"n = {len(t_scores)}, r = {cat_pearson:.4f}, MAE = {cat_mae:.4f}")
+    
+    print(f"\nTop 5 Best Predicted Images (Lowest Absolute Error):")
+    best_predictions = sorted(results, key=lambda x: x['abs_diff'])[:5]
+    for i, r in enumerate(best_predictions):
+        print(f"{i+1}. {r['image_name']}: NIMA = {r['teacher_score']:.2f}, LightNIMA = {r['lite_nima_score']:.2f}, " +
+              f"Diff = {r['abs_diff']:.4f}")
+    
+    print(f"\nTop 5 Worst Predicted Images (Highest Absolute Error):")
+    worst_predictions = sorted(results, key=lambda x: x['abs_diff'], reverse=True)[:5]
+    for i, r in enumerate(worst_predictions):
+        print(f"{i+1}. {r['image_name']}: NIMA = {r['teacher_score']:.2f}, LightNIMA = {r['lite_nima_score']:.2f}, " +
+              f"Diff = {r['abs_diff']:.4f}")
+    
+    print(f"\nResults saved to: {results_dir}")
+    print(f"- Detailed CSV: {csv_details_path}")
+    print(f"- Summary CSV: {csv_summary_path}")
+    print(f"- Visualizations: {len(os.listdir(vis_dir))} distribution plots + 5 summary charts")
+    
+    # Create a README file with summary information
+    with open(os.path.join(results_dir, "README.md"), 'w') as f:
+        f.write("# Drone Image Aesthetics Assessment Results\n\n")
+        f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("## Model Comparison\n\n")
+        f.write("| Metric | NIMA | LightNIMA | Improvement |\n")
+        f.write("|--------|------|-----------|------------|\n")
+        f.write(f"| Model Size | {teacher_size:.2f} MB | {lite_nima_size:.2f} MB | {size_reduction:.1f}% reduction |\n")
+        f.write(f"| Inference Time | {avg_teacher_time:.2f} ms | {avg_lite_nima_time:.2f} ms | {avg_speedup:.2f}x faster |\n")
+        f.write(f"| Pearson Correlation | - | {pearson_corr:.4f} | - |\n")
+        f.write(f"| Spearman Correlation | - | {spearman_corr:.4f} | - |\n")
+        f.write(f"| Mean Absolute Error | - | {mae:.4f} | - |\n")
+        f.write(f"| Root Mean Square Error | - | {rmse:.4f} | - |\n\n")
+        
+        f.write("## Visualization Files\n\n")
+        f.write("- `score_correlation.png`: Scatter plot of NIMA vs. LightNIMA scores\n")
+        f.write("- `error_distribution.png`: Histogram of prediction errors\n")
+        f.write("- `time_comparison.png`: Comparison of inference times\n")
+        f.write("- `model_size_comparison.png`: Comparison of model sizes\n")
+        f.write("- `average_distribution.png`: Average score distribution comparison\n")
+        f.write(f"- `distributions/`: {len(os.listdir(vis_dir))} individual distribution plots\n\n")
+        
+        f.write("## Data Files\n\n")
+        f.write("- `detailed_results.csv`: Detailed metrics for each image\n")
+        f.write("- `summary_statistics.csv`: Summary statistics for model comparison\n")
+    
+    # Return results dictionary for further analysis if needed
+    return {
+        'results_dir': results_dir,
+        'results': results,
+        'summary': {
+            'pearson': pearson_corr,
+            'spearman': spearman_corr,
+            'mae': mae,
+            'rmse': rmse,
+            'mape': mape,
+            'speedup': avg_speedup,
+            'size_reduction': size_reduction
+        }
+    }
+
+
+
 if __name__ == "__main__":
     # train_efficient_student(False) 
 
@@ -2515,6 +3339,10 @@ if __name__ == "__main__":
 
     # validate_models()  # 运行模型验证比较
 
-    train_lite_nima()
+    # train_lite_nima(False)
     # validate_lite_nima()
     # pred_single_with_time_lite_nima()
+    # batch_predict_drone_images()
+    batch_predict_drone_images_for_paper()
+
+ 

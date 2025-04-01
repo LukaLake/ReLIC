@@ -1,0 +1,12 @@
+metric,nima,light_nima
+Model Size (MB),17.38,1.18
+Size Reduction (%),-,93.24
+Average Inference Time (ms),10.11,3.19
+Speed Improvement (%),-,68.41
+Pearson Correlation,-,0.9461 (p=0.0000)
+Spearman Correlation,-,0.9030 (p=0.0003)
+Mean Absolute Error,-,0.2786
+Root Mean Square Error,-,0.2952
+Mean Absolute Percentage Error (%),-,4.77
+Medium Range Correlation,-,0.9461 (n=10)
+Medium Range MAE,-,0.2786

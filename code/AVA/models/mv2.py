@@ -135,7 +135,7 @@ def mobile_net_v2(pretrained=True):
         path_to_model = os.path.join(directory_name, '../pretrain_model/mobilenetv2.pth.tar')
         if not os.path.exists(path_to_model):
             path_to_model = download_file(MOBILE_NET_V2_UTR, path_to_model)
-        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage)
+        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage, weights_only=False)
         model.load_state_dict(state_dict)
     return model
 
@@ -163,7 +163,7 @@ def base_net(pretrained = True):
 
     if pretrained:
         path_to_model = os.path.join(directory_name, "../pretrain_model/u_model.pth")
-        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage)
+        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage, weights_only=False)
 
         new_state_dict = OrderedDict()
         for k,v in state_dict.items():
@@ -182,7 +182,7 @@ def sa_net(pretrained = True):
     model_dict = model.state_dict()
     if pretrained:
         path_to_model = os.path.join(directory_name, "../pretrain_model/e_model.pth")
-        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage)
+        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage, weights_only=False)
         from collections import OrderedDict
         new_state_dict = OrderedDict()
         for k,v in state_dict.items():
