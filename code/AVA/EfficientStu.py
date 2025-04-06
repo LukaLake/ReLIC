@@ -3456,34 +3456,38 @@ def batch_predict_drone_images_for_paper():
 
 def export_all_models():
     """
-    Export both the original NIMA model and LightNIMA model to ONNX format
-    for comparison and deployment
+    导出 NIMA 教师模型和 LightNIMA 模型到 ONNX 格式，用于部署
+    改进版本：针对新的 LightNIMA 结构进行了优化，确保 ONNX 兼容性
     """
     print("=" * 40)
     print("Exporting Models to ONNX")
     print("=" * 40)
     
     opt = option.init()
-    # 修复错误1：正确设置device属性
-    opt.device = torch.device(f"cuda:{opt.gpu_id}" if torch.cuda.is_available() else "cpu")
+    opt.device = torch.device('cpu')  # 强制使用CPU进行导出以避免设备不匹配问题
     
     output_dir = os.path.join(os.path.dirname(__file__), "exported_models")
     os.makedirs(output_dir, exist_ok=True)
     
-    # Export original NIMA teacher model
+    # 导出NIMA教师模型
     try:
         teacher_path = opt.path_to_teacher_model_weight
         teacher_onnx_path = os.path.join(output_dir, "nima_teacher.onnx")
         
-        # Initialize model
+        # 初始化模型
         teacher = init_teacher_model(opt)
         teacher.to('cpu').eval()
         
-        # Create dummy input tensor
+        # 创建测试输入
         dummy_input = torch.randn(1, 3, 224, 224)
         
-        # Export teacher model
-        print("Exporting teacher model to ONNX...")
+        # 验证PyTorch模型可以正常推理
+        with torch.no_grad():
+            teacher_output = teacher(dummy_input)
+            print(f"Teacher model output shape: {teacher_output.shape}")
+        
+        # 导出教师模型
+        print("Exporting NIMA teacher model to ONNX...")
         torch.onnx.export(
             teacher,
             dummy_input,
@@ -3492,164 +3496,192 @@ def export_all_models():
             opset_version=11,
             do_constant_folding=True,
             input_names=['input'],
-            output_names=['output']
+            output_names=['output'],
+            verbose=False
         )
         print(f"Teacher model exported to {teacher_onnx_path}")
     except Exception as e:
         print(f"Failed to export teacher model: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # 修复错误2：为LightNIMA模型创建一个ONNX兼容的导出版本
+    # 导出LightNIMA模型 - 使用优化后的结构
     try:
-        print("\nExporting LightNIMA model to ONNX...")
-        
-        # 加载原始模型
         lite_nima_path = os.path.join(os.path.dirname(__file__), "trained_models", "lite_nima", "lite_nima_best.pth")
+        lite_nima_onnx_path = os.path.join(output_dir, "lite_nima.onnx")
+        
+        # 加载模型
         lite_nima = LightNIMA(pretrained=False)
         lite_nima.load_state_dict(torch.load(lite_nima_path, map_location='cpu', weights_only=True))
-        lite_nima.eval()
+        lite_nima.to('cpu').eval()
         
-        # 创建一个ONNX兼容版本的LightNIMA类
-        class LightNIMAONNXCompatible(nn.Module):
-            def __init__(self, original_model):
-                super().__init__()
-                self.original_model = original_model
-                
-                # 直接从原始模型复制所有必要的部分
-                self.base_model = original_model.base_model
-                self.sa = original_model.sa
-                self.fc = original_model.fc
-                self.relu = original_model.relu
-                self.fc1 = original_model.fc1
-                self.sm = original_model.sm
-                
-                # 将分类器层拆分出来，避免adaptive_avg_pool2d问题
-                self.pre_classifier = nn.Sequential(
-                    # 这里只放入用于特征提取的层，不包括adaptive_avg_pool2d
-                )
-                
-                # 输出层
-                self.classifier_final = nn.Sequential(
-                    nn.Linear(original_model.classifier[0].in_features, 128),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(p=0.5),
-                    nn.Linear(128, 10),
-                    nn.Softmax(dim=1)
-                )
-                
-                # 从原始模型复制权重
-                self.classifier_final[0].weight = original_model.classifier[0].weight
-                self.classifier_final[0].bias = original_model.classifier[0].bias
-                self.classifier_final[2].p = original_model.classifier[2].p
-                self.classifier_final[3].weight = original_model.classifier[3].weight
-                self.classifier_final[3].bias = original_model.classifier[3].bias
-                
-            def forward(self, x):
-                # 基础特征提取
-                x_feat = self.base_model(x)
-                
-                # 特征扁平化 - 变为2D特征而非3D
-                n, c, h, w = x_feat.size()
-                x1 = x_feat.view(n, -1)  # [B, C*H*W] 直接将空间维度展平
-                
-                # 自注意力处理
-                x_sa = self.sa(x_feat)
-                x2 = self.get_attention_map(x_sa)  # [B, H*W, H*W]
-                x2 = x2.view(n, -1)  # [B, H*W*H*W]
-                
-                # 计算统计特征 - 确保都是2D张量
-                x1_max = torch.max(x1, dim=1)[0].unsqueeze(1)  # [B, 1]
-                x1_min = torch.min(x1, dim=1)[0].unsqueeze(1)  # [B, 1]
-                x1_mean = torch.mean(x1, dim=1).unsqueeze(1)   # [B, 1]
-                x1_std = torch.std(x1, dim=1).unsqueeze(1)     # [B, 1]
-                x1_stats = torch.cat([x1_max, x1_min, x1_mean, x1_std], 1)  # [B, 4]
-                
-                x2_max = torch.max(x2, dim=1)[0].unsqueeze(1)  # [B, 1]
-                x2_min = torch.min(x2, dim=1)[0].unsqueeze(1)  # [B, 1]
-                x2_mean = torch.mean(x2, dim=1).unsqueeze(1)   # [B, 1]
-                x2_std = torch.std(x2, dim=1).unsqueeze(1)     # [B, 1]
-                x2_stats = torch.cat([x2_max, x2_min, x2_mean, x2_std], 1)  # [B, 4]
-                
-                # 组合统计特征
-                x_stats = torch.cat([x1_stats, x2_stats], 1)  # [B, 8] 
-                
-                # 加权系数计算 - 与原始NIMA完全一致
-                weights = self.sm(self.fc1(self.relu(self.fc(x_stats))))  # [B, 2]
-                
-                # 特征加权 - 与原始保持一致的处理流程
-                x1 = x1 * weights[:, 0:1]  # [B, C*H*W] 
-                x1_weighted = x1.view(n, c, h, w)  # 恢复空间维度 [B, C, H, W]
-                
-                # 使用固定大小的特征向量而非adaptive_avg_pool2d
-                # 这里我们用展平并截取固定数量的特征来替代
-                features_for_cls = x1_weighted.view(n, c*h*w)
-                # 截取固定数量的特征
-                features_size = min(features_for_cls.size(1), c*10*2)
-                features_for_cls = features_for_cls[:, :features_size]
-                
-                # 最终分类
-                output = self.classifier_final(features_for_cls)
-                
-                return output
-            
-            def get_attention_map(self, x):
-                """计算自注意力图 - 与原始模型相同"""
-                return self.original_model.get_attention_map(x)
-        
-        # 创建兼容版本的模型
-        lite_nima_onnx = LightNIMAONNXCompatible(lite_nima)
-        lite_nima_onnx.eval()
-        
-        # 检查模型是否与原始模型输出一致
-        test_input = torch.randn(1, 3, 224, 224)
+        # 验证PyTorch模型可以正常推理
         with torch.no_grad():
-            original_output = lite_nima(test_input)
-            onnx_output = lite_nima_onnx(test_input)
+            lite_output = lite_nima(dummy_input)
+            print(f"LightNIMA model output shape: {lite_output.shape}")
         
-        output_diff = torch.mean(torch.abs(original_output - onnx_output))
-        print(f"Model output difference: {output_diff.item():.8f}")
-        
-        # 如果输出差异太大，可以考虑其他解决方案
-        if output_diff > 0.1:
-            print("Warning: ONNX compatible model has significant output differences!")
-        
-        # 导出到ONNX
-        lite_nima_onnx_path = os.path.join(output_dir, "lite_nima.onnx")
+        print("Exporting LightNIMA model to ONNX...")
+        # 现在应该可以直接导出，不需要额外的兼容层
         torch.onnx.export(
-            lite_nima_onnx,
-            test_input,
+            lite_nima,
+            dummy_input,
             lite_nima_onnx_path,
             export_params=True,
             opset_version=11,
             do_constant_folding=True,
             input_names=['input'],
             output_names=['output'],
-            dynamic_axes={
-                'input': {0: 'batch_size'},
-                'output': {0: 'batch_size'}
-            }
+            verbose=False
         )
         print(f"LightNIMA model exported to {lite_nima_onnx_path}")
         
-        # 比较文件大小
-        if os.path.exists(teacher_onnx_path) and os.path.exists(lite_nima_onnx_path):
-            teacher_size = os.path.getsize(teacher_onnx_path) / (1024 * 1024)
-            lite_nima_size = os.path.getsize(lite_nima_onnx_path) / (1024 * 1024)
-            size_reduction = (teacher_size - lite_nima_size) / teacher_size * 100
+        # 验证ONNX模型
+        try:
+            import onnx
+            onnx_model = onnx.load(lite_nima_onnx_path)
+            onnx.checker.check_model(onnx_model)
+            print("ONNX model verification passed!")
+        except ImportError:
+            print("ONNX Python package not available for verification.")
+        except Exception as e:
+            print(f"ONNX model verification failed: {e}")
             
-            print(f"\nFile size comparison:")
-            print(f"- Original NIMA: {teacher_size:.2f} MB")
-            print(f"- LightNIMA: {lite_nima_size:.2f} MB")
-            print(f"- Size reduction: {size_reduction:.1f}%")
     except Exception as e:
         print(f"Failed to export LightNIMA model: {e}")
         import traceback
         traceback.print_exc()
+    
+    # 比较文件大小
+    if os.path.exists(teacher_onnx_path) and os.path.exists(lite_nima_onnx_path):
+        teacher_size = os.path.getsize(teacher_onnx_path) / (1024 * 1024)
+        lite_nima_size = os.path.getsize(lite_nima_onnx_path) / (1024 * 1024)
+        size_reduction = (teacher_size - lite_nima_size) / teacher_size * 100
+        
+        print(f"\nModel file size comparison:")
+        print(f"- NIMA Teacher: {teacher_size:.2f} MB")
+        print(f"- LightNIMA: {lite_nima_size:.2f} MB")
+        print(f"- Size reduction: {size_reduction:.1f}%")
+        
+        return {
+            'teacher_path': teacher_onnx_path,
+            'lite_nima_path': lite_nima_onnx_path,
+            'teacher_size': teacher_size,
+            'lite_nima_size': lite_nima_size,
+            'size_reduction': size_reduction
+        }
+    
+    return None
+
+def test_onnxruntime_providers():
+    """
+    测试 ONNX Runtime 能否正常使用 CUDA 执行提供程序
+    并提供详细的环境诊断信息
+    """
+    import os
+    import sys
+    import torch
+    import platform
+    
+    print("=" * 50)
+    print("ONNX Runtime CUDA 支持诊断程序")
+    print("=" * 50)
+    
+    # 系统信息
+    print(f"\n系统信息:")
+    print(f"- 操作系统: {platform.system()} {platform.version()}")
+    print(f"- Python版本: {platform.python_version()}")
+    print(f"- CUDA_PATH环境变量: {os.environ.get('CUDA_PATH', '未设置')}")
+    
+    # PyTorch信息
+    print(f"\nPyTorch信息:")
+    print(f"- PyTorch版本: {torch.__version__}")
+    print(f"- CUDA是否可用: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"- CUDA版本: {torch.version.cuda}")
+        print(f"- cuDNN版本: {torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else '不可用'}")
+        print(f"- GPU设备: {torch.cuda.get_device_name(0)}")
+    
+    # ONNX Runtime信息
+    try:
+        import onnxruntime as ort
+        print(f"\nONNX Runtime信息:")
+        print(f"- ONNX Runtime版本: {ort.__version__}")
+        
+        # 检查可用的执行提供程序
+        providers = ort.get_available_providers()
+        print(f"- 可用执行提供程序: {providers}")
+        
+        # 检查CUDA提供程序是否可用
+        if 'CUDAExecutionProvider' in providers:
+            print(f"- CUDA执行提供程序可用 ✅")
+            
+            # 测试CUDA执行提供程序
+            try:
+                # 创建一个简单的会话
+                options = ort.SessionOptions()
+                session = ort.InferenceSession(
+                    # 创建一个内存模型而不是文件
+                    b"", 
+                    options,
+                    providers=['CUDAExecutionProvider']
+                )
+                print("- CUDA执行提供程序测试成功 ✅")
+            except Exception as e:
+                print(f"- CUDA执行提供程序测试失败: {e}")
+                print("- 尝试诊断问题...")
+                
+                # 检查CUDA库路径
+                cuda_dll_path = os.path.join(os.environ.get('CUDA_PATH', ''), 'bin', 'cudart64_*.dll')
+                print(f"- 查找CUDA运行时库: {cuda_dll_path}")
+                
+                import glob
+                cuda_dlls = glob.glob(cuda_dll_path)
+                if cuda_dlls:
+                    print(f"- 找到CUDA运行时库: {cuda_dlls}")
+                else:
+                    print(f"- 未找到CUDA运行时库")
+                
+                # 检查ONNX Runtime CUDA库
+                ort_path = os.path.dirname(ort.__file__)
+                ort_cuda_path = os.path.join(ort_path, "capi", "onnxruntime_providers_cuda.dll")
+                print(f"- ONNX Runtime CUDA提供程序库路径: {ort_cuda_path}")
+                print(f"- 文件存在: {os.path.exists(ort_cuda_path)}")
+        else:
+            print(f"- CUDA执行提供程序不可用 ❌")
+            print("- 可能的原因:")
+            print("  1. 安装了CPU-only版本的ONNX Runtime")
+            print("  2. CUDA或cuDNN版本与ONNX Runtime不兼容")
+            print("  3. ONNX Runtime没有正确找到CUDA库")
+            
+        # 建议解决方案
+        print("\n解决方案建议:")
+        if 'CUDAExecutionProvider' not in providers:
+            print("1. 安装ONNX Runtime GPU版本:")
+            print("   pip uninstall onnxruntime onnxruntime-gpu")
+            print("   pip install onnxruntime-gpu")
+            
+            print("\n2. 确保CUDA和cuDNN已正确安装，且版本兼容:")
+            print("   - ONNX Runtime 1.8-1.9: CUDA 11.0/11.1, cuDNN 8.0.5")
+            print("   - ONNX Runtime 1.10-1.11: CUDA 11.4, cuDNN 8.2.4")
+            print("   - ONNX Runtime 1.12+: CUDA 11.6, cuDNN 8.4.0")
+            
+            print("\n3. 确保CUDA_PATH环境变量正确设置")
+        
+    except ImportError:
+        print("\nONNX Runtime未安装")
+        print("安装建议: pip install onnxruntime-gpu")
+
+    print("\n如果问题仍然存在，可以暂时使用CPU执行提供程序运行比较测试:")
+    print("compare_onnx_vs_pytorch_models(False)  # 使用CPU运行")
 
 
-def compare_onnx_vs_pytorch_models():
+def compare_onnx_vs_pytorch_models(use_gpu=False):
     """
     比较ONNX导出模型与原始PyTorch模型在推理性能和精度上的差异
     生成详细报告和可视化结果
+    
+    参数:
+        use_gpu: 是否使用GPU进行PyTorch推理（ONNX始终使用CPU）
     """
     import time
     import os
@@ -3664,9 +3696,15 @@ def compare_onnx_vs_pytorch_models():
     print("=" * 50)
     
     opt = option.init()
-    # 重要：将设备明确设置为CPU，以确保一致性
-    opt.device = torch.device('cpu')
-    device = torch.device('cpu')
+    # 根据参数设置设备
+    if use_gpu and torch.cuda.is_available():
+        device = torch.device(f"cuda:{opt.gpu_id}")
+        print("使用GPU进行PyTorch推理")
+    else:
+        device = torch.device('cpu')
+        print("使用CPU进行所有推理")
+    
+    opt.device = device
     
     # 模型路径
     teacher_pt_path = opt.path_to_teacher_model_weight
@@ -3680,6 +3718,8 @@ def compare_onnx_vs_pytorch_models():
         print("ONNX模型文件不存在，请先运行export_all_models()")
         return
     
+    print("加载模型中...")
+    
     # 加载PyTorch模型
     teacher_pt = init_teacher_model(opt)
     teacher_pt.eval().to(device)
@@ -3689,9 +3729,14 @@ def compare_onnx_vs_pytorch_models():
     lite_nima_pt.eval().to(device)
     
     # 加载ONNX模型
-    print("正在加载ONNX模型...")
-    teacher_onnx = ort.InferenceSession(teacher_onnx_path, providers=['CPUExecutionProvider'])
-    lite_nima_onnx = ort.InferenceSession(lite_nima_onnx_path, providers=['CPUExecutionProvider'])
+    print("加载ONNX模型...")
+    # 为ONNX运行时选择合适的执行提供程序
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if use_gpu and 'CUDAExecutionProvider' in ort.get_available_providers() else ['CPUExecutionProvider']
+    session_options = ort.SessionOptions()
+    session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    
+    teacher_onnx = ort.InferenceSession(teacher_onnx_path, sess_options=session_options, providers=providers)
+    lite_nima_onnx = ort.InferenceSession(lite_nima_onnx_path, sess_options=session_options, providers=providers)
     
     # 图像预处理
     IMAGE_NET_MEAN = [0.485, 0.456, 0.406]
@@ -3724,7 +3769,8 @@ def compare_onnx_vs_pytorch_models():
     print(f"使用 {len(image_files)} 张图像进行性能测试")
     
     # 创建结果目录
-    results_dir = os.path.join(os.path.dirname(__file__), "results", "onnx_comparison")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    results_dir = os.path.join(os.path.dirname(__file__), "results", f"onnx_comparison_{timestamp}")
     os.makedirs(results_dir, exist_ok=True)
     
     # 存储结果
@@ -3740,19 +3786,30 @@ def compare_onnx_vs_pytorch_models():
         'lite_score_diff': [],
     }
     
-    # 批量预测和计时
-    print("开始性能测试...")
-    
-    # 创建一个用于CPU设备的评分函数
-    def get_score_cpu(y_pred):
-        # 确保使用CPU版本的权重
+    # 创建一个设备无关的评分函数
+    def get_score_device_agnostic(y_pred, device):
         w = torch.from_numpy(np.linspace(2, 11, 10)).float().to(device)
         w_batch = w.repeat(y_pred.size(0), 1)
         score = (y_pred * w_batch).sum(dim=1)
         score_np = score.data.cpu().numpy()
         return score, score_np
     
-    for img_path in tqdm(image_files):
+    print("开始性能测试...")
+    
+    # 运行预热以确保GPU和缓存准备就绪
+    print("预热中...")
+    dummy_input = torch.randn(1, 3, 224, 224).to(device)
+    with torch.no_grad():
+        _ = teacher_pt(dummy_input)
+        _ = lite_nima_pt(dummy_input)
+    
+    # ONNX运行时预热
+    dummy_input_np = dummy_input.cpu().numpy()
+    onnx_input = {'input': dummy_input_np}
+    _ = teacher_onnx.run(None, onnx_input)
+    _ = lite_nima_onnx.run(None, onnx_input)
+    
+    for img_path in tqdm(image_files, desc="测试进度"):
         img_name = os.path.basename(img_path)
         
         try:
@@ -3760,10 +3817,9 @@ def compare_onnx_vs_pytorch_models():
             image = default_loader(img_path)
             img_tensor = transform(image).unsqueeze(0).to(device)
             
-            # 准备ONNX输入格式
-            onnx_input = {
-                'input': img_tensor.cpu().numpy()
-            }
+            # 准备ONNX输入
+            img_numpy = img_tensor.cpu().numpy()
+            onnx_input = {'input': img_numpy}
             
             # ===== 教师模型测试 =====
             # PyTorch推理
@@ -3772,34 +3828,39 @@ def compare_onnx_vs_pytorch_models():
                 for _ in range(2):
                     _ = teacher_pt(img_tensor)
                 
-                # 计时
-                pt_start = time.time()
-                for _ in range(10):  # 多次运行取平均
+                # 计时 - 运行多次并取平均值
+                pytorch_times = []
+                for _ in range(5):
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    start = time.time()
                     teacher_pt_pred = teacher_pt(img_tensor)
-                pt_end = time.time()
-                teacher_pt_time = (pt_end - pt_start) * 100  # 单位: ms
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    end = time.time()
+                    pytorch_times.append((end - start) * 1000)  # ms
+                
+                teacher_pt_time = sum(pytorch_times) / len(pytorch_times)
             
             # ONNX推理
-            # 预热
-            for _ in range(2):
-                _ = teacher_onnx.run(None, onnx_input)
-                
-            # 计时
-            onnx_start = time.time()
-            for _ in range(10):  # 多次运行取平均
+            onnx_times = []
+            for _ in range(5):
+                start = time.time()
                 teacher_onnx_output = teacher_onnx.run(None, onnx_input)
-            onnx_end = time.time()
-            teacher_onnx_time = (onnx_end - onnx_start) * 100  # 单位: ms
+                end = time.time()
+                onnx_times.append((end - start) * 1000)  # ms
             
-            # 转换ONNX输出为张量 - 确保在CPU上
+            teacher_onnx_time = sum(onnx_times) / len(onnx_times)
+            
+            # 转换ONNX输出为PyTorch张量
             teacher_onnx_pred = torch.tensor(teacher_onnx_output[0], device=device)
             
-            # 计算分数差异 - 使用CPU版本的评分函数
-            _, teacher_pt_score = get_score_cpu(teacher_pt_pred)
-            _, teacher_onnx_score = get_score_cpu(teacher_onnx_pred)
+            # 计算分数
+            _, teacher_pt_score = get_score_device_agnostic(teacher_pt_pred, device)
+            _, teacher_onnx_score = get_score_device_agnostic(teacher_onnx_pred, device)
             
             teacher_score_diff = abs(teacher_pt_score[0] - teacher_onnx_score[0])
-            teacher_speedup = teacher_pt_time / teacher_onnx_time
+            teacher_speedup = teacher_pt_time / teacher_onnx_time if teacher_onnx_time > 0 else float('inf')
             
             # ===== LightNIMA模型测试 =====
             # PyTorch推理
@@ -3809,33 +3870,38 @@ def compare_onnx_vs_pytorch_models():
                     _ = lite_nima_pt(img_tensor)
                 
                 # 计时
-                pt_start = time.time()
-                for _ in range(10):  # 多次运行取平均
+                pytorch_times = []
+                for _ in range(5):
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    start = time.time()
                     lite_pt_pred = lite_nima_pt(img_tensor)
-                pt_end = time.time()
-                lite_pt_time = (pt_end - pt_start) * 100  # 单位: ms
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    end = time.time()
+                    pytorch_times.append((end - start) * 1000)
+                
+                lite_pt_time = sum(pytorch_times) / len(pytorch_times)
             
             # ONNX推理
-            # 预热
-            for _ in range(2):
-                _ = lite_nima_onnx.run(None, onnx_input)
-                
-            # 计时
-            onnx_start = time.time()
-            for _ in range(10):  # 多次运行取平均
+            onnx_times = []
+            for _ in range(5):
+                start = time.time()
                 lite_onnx_output = lite_nima_onnx.run(None, onnx_input)
-            onnx_end = time.time()
-            lite_onnx_time = (onnx_end - onnx_start) * 100  # 单位: ms
+                end = time.time()
+                onnx_times.append((end - start) * 1000)
             
-            # 转换ONNX输出为张量 - 确保在CPU上
+            lite_onnx_time = sum(onnx_times) / len(onnx_times)
+            
+            # 转换ONNX输出
             lite_onnx_pred = torch.tensor(lite_onnx_output[0], device=device)
             
-            # 计算分数差异 - 使用CPU版本的评分函数
-            _, lite_pt_score = get_score_cpu(lite_pt_pred)
-            _, lite_onnx_score = get_score_cpu(lite_onnx_pred)
+            # 计算分数
+            _, lite_pt_score = get_score_device_agnostic(lite_pt_pred, device)
+            _, lite_onnx_score = get_score_device_agnostic(lite_onnx_pred, device)
             
             lite_score_diff = abs(lite_pt_score[0] - lite_onnx_score[0])
-            lite_speedup = lite_pt_time / lite_onnx_time
+            lite_speedup = lite_pt_time / lite_onnx_time if lite_onnx_time > 0 else float('inf')
             
             # 保存结果
             results['image_name'].append(img_name)
@@ -3848,8 +3914,8 @@ def compare_onnx_vs_pytorch_models():
             results['lite_speedup'].append(lite_speedup)
             results['lite_score_diff'].append(lite_score_diff)
             
-            # 可选：为单个图像创建分布对比图
-            if len(results['image_name']) <= 3:  # 仅为前3张图像创建详细分布图
+            # 为前三个样本创建分布对比图
+            if len(results['image_name']) <= 3:
                 plt.figure(figsize=(16, 6))
                 
                 # 教师模型分布对比
@@ -3890,10 +3956,11 @@ def compare_onnx_vs_pytorch_models():
         except Exception as e:
             print(f"处理图像 {img_name} 时出错: {str(e)}")
             import traceback
-            traceback.print_exc()  # 打印完整堆栈跟踪
+            traceback.print_exc()
             continue
-
-    # 转换为DataFrame进行分析
+    
+    # 生成汇总结果和可视化
+    import pandas as pd
     df = pd.DataFrame(results)
     
     # 计算平均值
@@ -3965,72 +4032,85 @@ def compare_onnx_vs_pytorch_models():
     # 创建总结文档
     summary_path = os.path.join(results_dir, "onnx_comparison_summary.md")
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("# PyTorch vs ONNX 模型性能比较\n\n")
-        f.write(f"日期: {time.strftime('%Y-%m-%d')}\n\n")
+        f.write("# PyTorch vs ONNX Model Comparison\n\n")
+        f.write(f"Date: {time.strftime('%Y-%m-%d')}\n\n")
+        f.write(f"Device for PyTorch: {device.type.upper()}\n")
+        f.write(f"Device for ONNX: CPU\n\n")
         
-        f.write("## 推理性能\n\n")
-        f.write("| 模型 | PyTorch (ms) | ONNX (ms) | 加速比 |\n")
-        f.write("|------|------------|----------|--------|\n")
-        f.write(f"| Teacher | {avg_results['teacher_pt_time']:.2f} | {avg_results['teacher_onnx_time']:.2f} | {avg_results['teacher_speedup']:.2f}x |\n")
+        f.write("## Inference Performance\n\n")
+        f.write("| Model | PyTorch (ms) | ONNX (ms) | Speedup |\n")
+        f.write("|-------|-------------|-----------|--------|\n")
+        f.write(f"| NIMA Teacher | {avg_results['teacher_pt_time']:.2f} | {avg_results['teacher_onnx_time']:.2f} | {avg_results['teacher_speedup']:.2f}x |\n")
         f.write(f"| LightNIMA | {avg_results['lite_pt_time']:.2f} | {avg_results['lite_onnx_time']:.2f} | {avg_results['lite_speedup']:.2f}x |\n\n")
         
-        f.write("## 预测一致性\n\n")
-        f.write("| 模型 | PyTorch vs ONNX 分数差异 |\n")
-        f.write("|------|----------------------|\n")
-        f.write(f"| Teacher | {avg_results['teacher_score_diff']:.4f} |\n")
+        f.write("## Prediction Consistency\n\n")
+        f.write("| Model | PyTorch vs ONNX Score Difference |\n")
+        f.write("|-------|----------------------------------|\n")
+        f.write(f"| NIMA Teacher | {avg_results['teacher_score_diff']:.4f} |\n")
         f.write(f"| LightNIMA | {avg_results['lite_score_diff']:.4f} |\n\n")
         
-        f.write("## 文件大小\n\n")
+        f.write("## Model File Size\n\n")
         teacher_pt_size = os.path.getsize(teacher_pt_path) / (1024 * 1024)
         teacher_onnx_size = os.path.getsize(teacher_onnx_path) / (1024 * 1024) 
         lite_pt_size = os.path.getsize(lite_nima_pt_path) / (1024 * 1024)
         lite_onnx_size = os.path.getsize(lite_nima_onnx_path) / (1024 * 1024)
         
-        f.write("| 模型 | PyTorch (MB) | ONNX (MB) | 大小变化 |\n")
-        f.write("|------|------------|----------|--------|\n")
-        f.write(f"| Teacher | {teacher_pt_size:.2f} | {teacher_onnx_size:.2f} | {(teacher_onnx_size/teacher_pt_size-1)*100:.1f}% |\n")
+        f.write("| Model | PyTorch (MB) | ONNX (MB) | Size Change |\n")
+        f.write("|-------|-------------|-----------|-------------|\n")
+        f.write(f"| NIMA Teacher | {teacher_pt_size:.2f} | {teacher_onnx_size:.2f} | {(teacher_onnx_size/teacher_pt_size-1)*100:.1f}% |\n")
         f.write(f"| LightNIMA | {lite_pt_size:.2f} | {lite_onnx_size:.2f} | {(lite_onnx_size/lite_pt_size-1)*100:.1f}% |\n\n")
         
-        # 添加结论
-        f.write("## 结论\n\n")
-        f.write("ONNX导出后的模型表现如下：\n\n")
+        # 自动生成结论
+        f.write("## Conclusion\n\n")
         
-        # 根据结果自动生成结论
-        if avg_results['teacher_speedup'] > 1.2 and avg_results['lite_speedup'] > 1.2:
-            f.write("- ✅ **显著提升推理速度**：ONNX模型推理速度明显快于PyTorch模型\n")
-        elif avg_results['teacher_speedup'] > 1.05 and avg_results['lite_speedup'] > 1.05:
-            f.write("- ✅ **轻微提升推理速度**：ONNX模型推理速度略快于PyTorch模型\n")
+        # Performance conclusion
+        if avg_results['teacher_speedup'] > 1.5 and avg_results['lite_speedup'] > 1.5:
+            f.write("- ✅ **Significant performance improvement**: ONNX models are substantially faster than PyTorch models\n")
+        elif avg_results['teacher_speedup'] > 1.1 and avg_results['lite_speedup'] > 1.1:
+            f.write("- ✅ **Modest performance improvement**: ONNX models are somewhat faster than PyTorch models\n")
         else:
-            f.write("- ⚠️ **性能提升有限**：ONNX模型未带来明显的性能提升\n")
+            f.write("- ⚠️ **Limited performance gain**: ONNX models do not provide significant speed improvements\n")
         
+        # Accuracy conclusion
         if avg_results['teacher_score_diff'] < 0.01 and avg_results['lite_score_diff'] < 0.01:
-            f.write("- ✅ **预测结果高度一致**：ONNX模型与原PyTorch模型预测结果几乎完全一致\n")
+            f.write("- ✅ **High prediction consistency**: ONNX models produce almost identical results to PyTorch models\n")
         elif avg_results['teacher_score_diff'] < 0.1 and avg_results['lite_score_diff'] < 0.1:
-            f.write("- ✅ **预测结果基本一致**：ONNX模型与原PyTorch模型预测结果非常接近\n")
+            f.write("- ✅ **Good prediction consistency**: ONNX models produce very similar results to PyTorch models\n")
         else:
-            f.write("- ⚠️ **预测结果存在差异**：ONNX模型与原PyTorch模型预测结果有一定差异\n")
+            f.write("- ⚠️ **Prediction discrepancy**: ONNX models show noticeable differences from PyTorch models\n")
         
+        # Size conclusion
+        lite_pt_to_teacher_pt = lite_pt_size / teacher_pt_size
+        lite_onnx_to_teacher_onnx = lite_onnx_size / teacher_onnx_size
+        
+        if lite_pt_to_teacher_pt < 0.5 and lite_onnx_to_teacher_onnx < 0.5:
+            f.write("- ✅ **Significant model compression**: LightNIMA is less than half the size of NIMA Teacher in both formats\n")
+        elif lite_pt_to_teacher_pt < 0.75 and lite_onnx_to_teacher_onnx < 0.75:
+            f.write("- ✅ **Good model compression**: LightNIMA is noticeably smaller than NIMA Teacher in both formats\n")
+        else:
+            f.write("- ℹ️ **Moderate compression**: LightNIMA offers some size reduction compared to NIMA Teacher\n")
+            
+    
     # 打印结果摘要
     print("\n" + "="*60)
-    print("PyTorch vs ONNX 模型性能比较结果")
+    print("PyTorch vs ONNX Model Performance Comparison")
     print("="*60)
-    print(f"\n推理时间 (ms):")
-    print(f"- Teacher模型:  PyTorch = {avg_results['teacher_pt_time']:.2f}, ONNX = {avg_results['teacher_onnx_time']:.2f}, 加速比 = {avg_results['teacher_speedup']:.2f}x")
-    print(f"- LightNIMA模型: PyTorch = {avg_results['lite_pt_time']:.2f}, ONNX = {avg_results['lite_onnx_time']:.2f}, 加速比 = {avg_results['lite_speedup']:.2f}x")
+    print(f"\nInference Time (ms):")
+    print(f"- NIMA Teacher:  PyTorch = {avg_results['teacher_pt_time']:.2f}, ONNX = {avg_results['teacher_onnx_time']:.2f}, Speedup = {avg_results['teacher_speedup']:.2f}x")
+    print(f"- LightNIMA: PyTorch = {avg_results['lite_pt_time']:.2f}, ONNX = {avg_results['lite_onnx_time']:.2f}, Speedup = {avg_results['lite_speedup']:.2f}x")
     
-    print(f"\n预测一致性 (分数差异):")
-    print(f"- Teacher模型: {avg_results['teacher_score_diff']:.4f}")
-    print(f"- LightNIMA模型: {avg_results['lite_score_diff']:.4f}")
+    print(f"\nPrediction Consistency (Score Difference):")
+    print(f"- NIMA Teacher: {avg_results['teacher_score_diff']:.4f}")
+    print(f"- LightNIMA: {avg_results['lite_score_diff']:.4f}")
     
-    print(f"\n详细结果和图表已保存至: {results_dir}")
-    print(f"摘要报告: {summary_path}")
+    print(f"\nDetailed results and charts saved to: {results_dir}")
+    print(f"Summary report: {summary_path}")
     
     return {
         'avg_results': avg_results,
         'detailed_results': df,
         'results_dir': results_dir
     }
-
 
 if __name__ == "__main__":
     # train_efficient_student(False) 
@@ -4049,13 +4129,14 @@ if __name__ == "__main__":
 
     # validate_models()  # 运行模型验证比较
 
-    train_lite_nima(False)
+    # train_lite_nima(False)
     # validate_lite_nima()
     # pred_single_with_time_lite_nima()
     # batch_predict_drone_images()
     # batch_predict_drone_images_for_paper()
 
     # export_all_models()  # 导出模型为ONNX格式
-    # compare_onnx_vs_pytorch_models()  # 比较ONNX与PyTorch模型性能
+    compare_onnx_vs_pytorch_models(False)  # 比较ONNX与PyTorch模型性能
+    # test_onnxruntime_providers()  # 测试ONNX Runtime CUDA支持
 
  
