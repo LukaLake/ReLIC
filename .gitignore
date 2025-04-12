@@ -130,3 +130,9 @@ dmypy.json
 
 *.jpg
 *.png
+*.onnx
+*.pth
+
+code/AVA/trained_models/
+code/AVA/finetune_models/
+code/AVA/finetune_models_mixed/

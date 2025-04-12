@@ -135,7 +135,7 @@ def mobile_net_v2(pretrained=True):
         path_to_model = os.path.join(directory_name, '../pretrain_model/mobilenetv2.pth.tar')
         if not os.path.exists(path_to_model):
             path_to_model = download_file(MOBILE_NET_V2_UTR, path_to_model)
-        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage)
+        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage, weights_only=False)
         model.load_state_dict(state_dict)
     return model
 
@@ -156,11 +156,14 @@ def SelfAttentionMap(x):
 def base_net(pretrained = True):
     model = mobile_net_v2()
     model = nn.Sequential(*list(model.children())[:-1])
+    # def count_layers(model):
+    #     return sum(1 for _ in model.children())
+    # print(f"Total number of layers: {count_layers(model)}")
     model_dict = model.state_dict()
 
     if pretrained:
         path_to_model = os.path.join(directory_name, "../pretrain_model/u_model.pth")
-        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage)
+        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage, weights_only=False)
 
         new_state_dict = OrderedDict()
         for k,v in state_dict.items():
@@ -179,7 +182,7 @@ def sa_net(pretrained = True):
     model_dict = model.state_dict()
     if pretrained:
         path_to_model = os.path.join(directory_name, "../pretrain_model/e_model.pth")
-        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage)
+        state_dict = torch.load(path_to_model, map_location=lambda storage, loc: storage, weights_only=False)
         from collections import OrderedDict
         new_state_dict = OrderedDict()
         for k,v in state_dict.items():
@@ -204,11 +207,14 @@ class CAT(nn.Module):
     def forward(self, x):
         x_base = self.base_model(x)
         x_sa = self.sa_model(x)
+        # print(f"SA model output shape: {x_sa.shape}")  # [B, 1280, 7, 7]
         x_sa = SelfAttentionMap(x_sa)
+        # print(f"After attention map: {x_sa.shape}")    # [B, 49, 49]
         # 将张量 x_base 的形状重新设置为 (batch_size, -1)，
         # 其中 -1 表示 PyTorch 会自动计算出张量在该维度上的大小，以满足新张量的元素数量与原始张量相同的要求。
         x = x_base.view(x_base.size(0),-1) 
         x1 = x_sa.view(x_sa.size(0),-1)
+        # print(f"Reshaped sa model output: {x1.shape}") # [B, 2401]
 
         return x,x1
 
