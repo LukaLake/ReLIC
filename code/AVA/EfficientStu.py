@@ -3680,7 +3680,7 @@ def test_onnxruntime_providers():
                         print("- CUDA执行提供程序测试成功 ✅")
                     else:
                         print("- CUDA执行提供程序测试失败: 计算结果不匹配")
-                        
+
             except Exception as e:
                 print(f"- CUDA执行提供程序测试失败: {e}")
                 print("- 尝试诊断问题...")
@@ -3708,9 +3708,10 @@ def test_onnxruntime_providers():
             print("  2. CUDA或cuDNN版本与ONNX Runtime不兼容")
             print("  3. ONNX Runtime没有正确找到CUDA库")
             
-        # 建议解决方案
-        print("\n解决方案建议:")
+        
         if 'CUDAExecutionProvider' not in providers:
+            # 建议解决方案
+            print("\n解决方案建议:")
             print("1. 安装ONNX Runtime GPU版本:")
             print("   pip uninstall onnxruntime onnxruntime-gpu")
             print("   pip install onnxruntime-gpu")
