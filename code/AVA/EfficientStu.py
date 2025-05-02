@@ -3617,15 +3617,70 @@ def test_onnxruntime_providers():
             
             # 测试CUDA执行提供程序
             try:
-                # 创建一个简单的会话
-                options = ort.SessionOptions()
-                session = ort.InferenceSession(
-                    # 创建一个内存模型而不是文件
-                    b"", 
-                    options,
-                    providers=['CUDAExecutionProvider']
-                )
-                print("- CUDA执行提供程序测试成功 ✅")
+                # 使用已导出的ONNX模型进行测试
+                lite_nima_onnx_path = os.path.join(os.path.dirname(__file__), "exported_models", "lite_nima.onnx")
+                
+                # 如果存在已导出的模型，使用它测试
+                if os.path.exists(lite_nima_onnx_path):
+                    options = ort.SessionOptions()
+                    session = ort.InferenceSession(
+                        lite_nima_onnx_path,
+                        options,
+                        providers=['CUDAExecutionProvider']
+                    )
+                    print("- CUDA执行提供程序测试成功 ✅")
+                else:
+                    # 如果没有现成模型，创建一个极简ONNX模型
+                    import numpy as np
+                    from onnx import helper, TensorProto
+                    
+                    # 创建一个简单的加法操作的ONNX模型
+                    X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1, 3])
+                    Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1, 3])
+                    Z = helper.make_tensor_value_info('Z', TensorProto.FLOAT, [1, 3])
+                    
+                    # 定义一个简单的加法操作
+                    node_def = helper.make_node(
+                        'Add',  # 操作类型
+                        ['X', 'Y'],  # 输入
+                        ['Z'],  # 输出
+                    )
+                    
+                    # 创建图和模型
+                    graph_def = helper.make_graph(
+                        [node_def],
+                        'test-model',
+                        [X, Y],
+                        [Z],
+                    )
+                    
+                    model_def = helper.make_model(graph_def, producer_name='onnx-runtime-test')
+                    
+                    # 序列化模型
+                    model_bytes = model_def.SerializeToString()
+                    
+                    # 使用这个模型测试CUDA提供程序
+                    options = ort.SessionOptions()
+                    session = ort.InferenceSession(
+                        model_bytes,
+                        options,
+                        providers=['CUDAExecutionProvider']
+                    )
+                    
+                    # 真正运行一个推理确认它工作
+                    x_data = np.random.randn(1, 3).astype(np.float32)
+                    y_data = np.random.randn(1, 3).astype(np.float32)
+                    
+                    # 执行推理
+                    result = session.run(['Z'], {'X': x_data, 'Y': y_data})
+                    
+                    # 验证结果
+                    expected = x_data + y_data
+                    if np.allclose(result[0], expected):
+                        print("- CUDA执行提供程序测试成功 ✅")
+                    else:
+                        print("- CUDA执行提供程序测试失败: 计算结果不匹配")
+                        
             except Exception as e:
                 print(f"- CUDA执行提供程序测试失败: {e}")
                 print("- 尝试诊断问题...")
@@ -4136,7 +4191,7 @@ if __name__ == "__main__":
     # batch_predict_drone_images_for_paper()
 
     # export_all_models()  # 导出模型为ONNX格式
-    compare_onnx_vs_pytorch_models(False)  # 比较ONNX与PyTorch模型性能
-    # test_onnxruntime_providers()  # 测试ONNX Runtime CUDA支持
+    # compare_onnx_vs_pytorch_models(False)  # 比较ONNX与PyTorch模型性能
+    test_onnxruntime_providers()  # 测试ONNX Runtime CUDA支持
 
  
